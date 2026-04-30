@@ -1,0 +1,94 @@
+# MultiWordpress — shared infrastructure compose
+#
+# Covers requirements:
+#   INFRA-01  shared MariaDB + Redis containers, healthchecks, log caps, named volume
+#   INFRA-02  alt loopback ports (13306 / 16379) — no collision with AudioStoryV2 6379
+#   INFRA-03  dedicated bridge network `wp-network` with MTU 1460 (GCP VPC default)
+#   INFRA-04  utf8mb4 default charset/collation for MariaDB
+#   INFRA-06  restart: unless-stopped on every service
+#   HARD-01   loopback-only port bindings (127.0.0.1) — never 0.0.0.0
+#   HARD-03   every image pinned to a specific tag — never :latest
+#
+# Memory model note (INFRA-05 boundary):
+#   wp-mariadb and wp-redis run with their OWN `mem_limit` directives below.
+#   They are NOT part of the host `wp.slice` cgroup — that 4 GB cluster cap
+#   covers only the per-site WordPress containers built in Phase 2.
+
+services:
+
+  wp-mariadb:
+    image: mariadb:11.4
+    container_name: wp-mariadb
+    restart: unless-stopped
+    command:
+      - --innodb-buffer-pool-size=384M
+      - --max-connections=200
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --innodb-flush-log-at-trx-commit=2
+      - --innodb-flush-method=O_DIRECT
+    environment:
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD}
+      MARIADB_AUTO_UPGRADE: "1"
+    ports:
+      - "127.0.0.1:13306:3306"
+    volumes:
+      - wp_mariadb_data:/var/lib/mysql
+    networks:
+      - wp-network
+    mem_limit: 1g
+    mem_reservation: 512m
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+        compress: "true"
+
+  wp-redis:
+    image: redis:7-alpine
+    container_name: wp-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --save ""
+      --appendonly no
+      --tcp-backlog 511
+      --tcp-keepalive 300
+      --lazyfree-lazy-eviction yes
+      --lazyfree-lazy-expire yes
+      --loglevel notice
+    ports:
+      - "127.0.0.1:16379:6379"
+    networks:
+      - wp-network
+    mem_limit: 320m
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+        compress: "true"
+
+networks:
+  wp-network:
+    driver: bridge
+    name: wp-network
+    driver_opts:
+      com.docker.network.driver.mtu: "1460"
+
+volumes:
+  wp_mariadb_data:
