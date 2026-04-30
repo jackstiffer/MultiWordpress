@@ -442,6 +442,8 @@ gcloud compute instances delete multiwp-test --zone=us-central1-c
 | `cf-cache-status: MISS` always | Cache Rule not applied or plugin missing | Verify rule in Cloudflare dashboard; install `super-page-cache-for-cloudflare` |
 | `wp-create` says "site already exists" | Slug already in `/opt/wp/state/sites.json` from a partial run | `sudo wp-delete <slug> --yes` then retry, or `sudo wp-create <domain> --resume <slug>` |
 | `docker compose up` hangs on healthcheck | `MARIADB_ROOT_PASSWORD` not set in `/opt/wp/.env` | `sudo cat /opt/wp/.env` to verify; restart with `docker compose down && docker compose up -d` |
+| `Access denied for user 'root'@'localhost'` from `wp-create` | MariaDB's data volume was seeded with a different password than `/opt/wp/.env` currently has — usually because `compose up` ran before `init-secrets.sh`, or `.env` was edited after first boot | **Nuke + restart** (safe if no real sites yet): `sudo docker compose -f compose/compose.yaml down -v` → confirm `.env` has a real password (`sudo cat /opt/wp/.env`) → `sudo docker compose -f compose/compose.yaml up -d`. Then clean up any half-created site state: `sudo rm -f /opt/wp/secrets/<slug>.env` and `sudo jq 'del(.sites.<slug>)' /opt/wp/state/sites.json` (atomic temp+rename). |
+| `sudo wp-create: command not found` despite scripts being executable | `secure_path` in sudoers strips your PATH | Run with full path: `sudo /opt/wp/bin/wp-create ...`. Or symlink once: `sudo ln -s /opt/wp/bin/wp-* /usr/local/bin/`. |
 
 ---
 
