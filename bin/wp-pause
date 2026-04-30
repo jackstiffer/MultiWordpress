@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# =============================================================================
+# bin/wp-pause — Stop a MultiWordpress site (free RAM, keep DB/files/secrets)
+# =============================================================================
+#
+# Usage:
+#   wp-pause <slug> [--json] [-h|--help]
+#
+# Runs `docker compose stop` (NOT `down`) so the container record is kept and
+# wp-resume can bring it back fast. Updates sites.json state to "paused" and
+# appends to state_history.
+#
+# Idempotent: already-paused → no-op success.
+#
+# Requirements covered: CLI-14, STATE-01
+# Plan: .planning/phases/02-cli-core-first-site-e2e/02-PLAN-04-wp-delete-pause-resume.md
+# =============================================================================
+set -euo pipefail
+
+# shellcheck source=_lib.sh
+source "$(dirname "$0")/_lib.sh"
+
+usage() {
+    cat <<EOF
+wp-pause — stop a site's container; free its RAM; keep DB + files + secrets
+
+Usage:
+  wp-pause <slug> [--json]
+
+Arguments:
+  <slug>     Site slug
+
+Options:
+  --json     Emit result as JSON
+  -h, --help Show this help
+EOF
+}
+
+# ---- Parse args -----------------------------------------------------------
+SLUG=""
+for arg in "$@"; do
+    case "$arg" in
+        -h|--help) usage; exit 0 ;;
+        --json)    _JSON_MODE=1 ;;
+        --*)       _die "unknown option: $arg" ;;
+        *)
+            if [[ -z "$SLUG" ]]; then
+                SLUG="$arg"
+            else
+                _die "unexpected positional arg: $arg"
+            fi
+            ;;
+    esac
+done
+
+if [[ -z "$SLUG" ]]; then
+    usage >&2
+    _die "missing required <slug>"
+fi
+
+_require_root
+_require_cmd docker
+_require_cmd jq
+
+# ---- Validate site exists -------------------------------------------------
+SITE_JSON="$(_get_site "$SLUG")"
+if [[ -z "$SITE_JSON" || "$SITE_JSON" == "null" ]]; then
+    _die "site '$SLUG' not found in $STATE_FILE"
+fi
+
+DOMAIN="$(printf '%s' "$SITE_JSON" | jq -r '.domain // "(unknown)"')"
+STATE_NOW="$(printf '%s' "$SITE_JSON" | jq -r '.state // "unknown"')"
+
+# ---- Idempotent: already paused ------------------------------------------
+if [[ "$STATE_NOW" == "paused" ]]; then
+    if _is_json_mode; then
+        jq -n --arg slug "$SLUG" --arg domain "$DOMAIN" --arg status "paused" \
+              --arg message "already paused" \
+              '{slug: $slug, domain: $domain, status: $status, message: $message}'
+    else
+        _log info "site '$SLUG' is already paused"
+    fi
+    exit 0
+fi
+
+# ---- Stop the container ---------------------------------------------------
+COMPOSE_FILE="${SITES_DIR}/${SLUG}/compose.yaml"
+if [[ ! -f "$COMPOSE_FILE" ]]; then
+    _die "compose file not found: $COMPOSE_FILE (site corrupted?)"
+fi
+
+if ! docker compose -f "$COMPOSE_FILE" stop; then
+    _die "docker compose stop failed for $SLUG"
+fi
+
+# ---- Update sites.json ----------------------------------------------------
+TS="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+FRAGMENT="$(jq -n --arg ts "$TS" \
+    '{state: "paused", paused_at: $ts}')"
+_state_set_site "$SLUG" "$FRAGMENT" \
+    || _log warn "failed to update sites.json for $SLUG (container is stopped)"
+
+# Append to state_history (best-effort).
+HISTORY_FRAG="$(jq -n --arg ts "$TS" --arg state "paused" \
+    '{state_history: [{state: $state, at: $ts}]}')"
+CUR_STATE="$(_load_state)"
+NEW_STATE="$(printf '%s' "$CUR_STATE" | jq --arg s "$SLUG" --arg ts "$TS" \
+    '.sites[$s].state_history = ((.sites[$s].state_history // []) + [{state: "paused", at: $ts}])')" || true
+if [[ -n "$NEW_STATE" ]]; then
+    _save_state "$NEW_STATE" || true
+fi
+
+# ---- Output ---------------------------------------------------------------
+if _is_json_mode; then
+    jq -n --arg slug "$SLUG" --arg domain "$DOMAIN" --arg status "paused" \
+          --arg message "site stopped; RAM freed" \
+          '{slug: $slug, domain: $domain, status: $status, message: $message}'
+else
+    printf '✓ Site %s (%s) paused. RAM freed; DB + files + secrets intact.\n' "$SLUG" "$DOMAIN"
+    printf '  Resume with: wp-resume %s\n' "$SLUG"
+    printf '\n# Optional: swap your Caddy block for this stub while paused:\n'
+    printf '# %s {\n' "$DOMAIN"
+    printf '#     respond "Site temporarily paused" 503\n'
+    printf '# }\n'
+fi
+
+exit 0

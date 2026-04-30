@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# =============================================================================
+# bin/wp-resume — Start a paused MultiWordpress site
+# =============================================================================
+#
+# Usage:
+#   wp-resume <slug> [--json] [-h|--help]
+#
+# Runs `docker compose up -d`, waits for the container to be running, and
+# updates sites.json state back to "finalized".
+#
+# Idempotent: already-running → no-op success.
+#
+# Requirements covered: CLI-14, STATE-01
+# Plan: .planning/phases/02-cli-core-first-site-e2e/02-PLAN-04-wp-delete-pause-resume.md
+# =============================================================================
+set -euo pipefail
+
+# shellcheck source=_lib.sh
+source "$(dirname "$0")/_lib.sh"
+
+usage() {
+    cat <<EOF
+wp-resume — start a paused site's container
+
+Usage:
+  wp-resume <slug> [--json]
+
+Arguments:
+  <slug>     Site slug
+
+Options:
+  --json     Emit result as JSON
+  -h, --help Show this help
+EOF
+}
+
+# ---- Parse args -----------------------------------------------------------
+SLUG=""
+for arg in "$@"; do
+    case "$arg" in
+        -h|--help) usage; exit 0 ;;
+        --json)    _JSON_MODE=1 ;;
+        --*)       _die "unknown option: $arg" ;;
+        *)
+            if [[ -z "$SLUG" ]]; then
+                SLUG="$arg"
+            else
+                _die "unexpected positional arg: $arg"
+            fi
+            ;;
+    esac
+done
+
+if [[ -z "$SLUG" ]]; then
+    usage >&2
+    _die "missing required <slug>"
+fi
+
+_require_root
+_require_cmd docker
+_require_cmd jq
+
+# ---- Validate site exists -------------------------------------------------
+SITE_JSON="$(_get_site "$SLUG")"
+if [[ -z "$SITE_JSON" || "$SITE_JSON" == "null" ]]; then
+    _die "site '$SLUG' not found in $STATE_FILE"
+fi
+
+DOMAIN="$(printf '%s' "$SITE_JSON" | jq -r '.domain // "(unknown)"')"
+STATE_NOW="$(printf '%s' "$SITE_JSON" | jq -r '.state // "unknown"')"
+
+# ---- Idempotent: already running -----------------------------------------
+container_running() {
+    local cid
+    cid="$(docker ps -q --filter "name=^wp-${SLUG}$" 2>/dev/null || true)"
+    [[ -n "$cid" ]]
+}
+
+if [[ "$STATE_NOW" == "finalized" ]] && container_running; then
+    if _is_json_mode; then
+        jq -n --arg slug "$SLUG" --arg domain "$DOMAIN" --arg status "running" \
+              --arg message "already running" \
+              '{slug: $slug, domain: $domain, status: $status, message: $message}'
+    else
+        _log info "site '$SLUG' is already running"
+    fi
+    exit 0
+fi
+
+# ---- Pre-flight: shared infra healthy ------------------------------------
+if ! docker ps -q --filter "name=^wp-mariadb$" --filter "status=running" | grep -q .; then
+    _die "shared infra not running: wp-mariadb container not up"
+fi
+if ! docker ps -q --filter "name=^wp-redis$" --filter "status=running" | grep -q .; then
+    _die "shared infra not running: wp-redis container not up"
+fi
+
+# ---- Start the container --------------------------------------------------
+COMPOSE_FILE="${SITES_DIR}/${SLUG}/compose.yaml"
+if [[ ! -f "$COMPOSE_FILE" ]]; then
+    _die "compose file not found: $COMPOSE_FILE (site corrupted?)"
+fi
+
+if ! docker compose -f "$COMPOSE_FILE" up -d; then
+    _die "docker compose up -d failed for $SLUG"
+fi
+
+# ---- Wait for container running (up to 30s) ------------------------------
+WAIT_DEADLINE=$(( $(date +%s) + 30 ))
+while (( $(date +%s) < WAIT_DEADLINE )); do
+    if container_running; then
+        break
+    fi
+    sleep 1
+done
+
+if ! container_running; then
+    _die "container wp-${SLUG} did not reach running state within 30s"
+fi
+
+# ---- Update sites.json ----------------------------------------------------
+TS="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+FRAGMENT="$(jq -n --arg ts "$TS" \
+    '{state: "finalized", resumed_at: $ts}')"
+_state_set_site "$SLUG" "$FRAGMENT" \
+    || _log warn "failed to update sites.json for $SLUG (container is running)"
+
+CUR_STATE="$(_load_state)"
+NEW_STATE="$(printf '%s' "$CUR_STATE" | jq --arg s "$SLUG" --arg ts "$TS" \
+    '.sites[$s].state_history = ((.sites[$s].state_history // []) + [{state: "finalized", at: $ts}])')" || true
+if [[ -n "$NEW_STATE" ]]; then
+    _save_state "$NEW_STATE" || true
+fi
+
+# ---- Output ---------------------------------------------------------------
+if _is_json_mode; then
+    jq -n --arg slug "$SLUG" --arg domain "$DOMAIN" --arg status "running" \
+          --arg message "site resumed" \
+          '{slug: $slug, domain: $domain, status: $status, message: $message}'
+else
+    printf '✓ Site %s (%s) resumed. URL: https://%s\n' "$SLUG" "$DOMAIN" "$DOMAIN"
+fi
+
+exit 0

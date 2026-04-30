@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+# =============================================================================
+# bin/wp-delete — Tear down a MultiWordpress site (container, DB, files, secrets)
+# =============================================================================
+#
+# Usage:
+#   wp-delete <slug> [--yes] [--json] [-h|--help]
+#
+# Removes:
+#   - per-site container (docker compose down)
+#   - DB + DB user (DROP DATABASE / DROP USER)
+#   - /opt/wp/sites/<slug>/         (compose.yaml + wp-content)
+#   - /opt/wp/secrets/<slug>.env
+#   - sites.json registry entry
+#
+# Prints Caddy + Cloudflare cleanup snippets so the operator can finish the
+# job (we cannot edit /etc/caddy or Cloudflare DNS for you).
+#
+# Requirements covered: CLI-06, STATE-01, STATE-02
+# Plan: .planning/phases/02-cli-core-first-site-e2e/02-PLAN-04-wp-delete-pause-resume.md
+# =============================================================================
+set -euo pipefail
+
+# shellcheck source=_lib.sh
+source "$(dirname "$0")/_lib.sh"
+
+usage() {
+    cat <<EOF
+wp-delete — delete a MultiWordpress site (destructive, no undo)
+
+Usage:
+  wp-delete <slug> [--yes] [--json]
+
+Arguments:
+  <slug>     Site slug (as listed by wp-list)
+
+Options:
+  --yes      Skip interactive confirmation (required for non-tty)
+  --json     Emit cleanup snippets as JSON
+  -h, --help Show this help
+
+This removes the container, DB, DB user, site directory, secrets file,
+and the sites.json entry. It then prints the Caddy block and Cloudflare
+DNS row that you must remove manually.
+EOF
+}
+
+# ---- Parse args -----------------------------------------------------------
+SLUG=""
+ASSUME_YES=0
+for arg in "$@"; do
+    case "$arg" in
+        -h|--help)  usage; exit 0 ;;
+        --yes)      ASSUME_YES=1 ;;
+        --json)     _JSON_MODE=1 ;;
+        --*)        _die "unknown option: $arg" ;;
+        *)
+            if [[ -z "$SLUG" ]]; then
+                SLUG="$arg"
+            else
+                _die "unexpected positional arg: $arg"
+            fi
+            ;;
+    esac
+done
+
+[[ -n "$SLUG" ]] || { usage >&2; _die "missing required <slug>"; }
+
+_require_root
+_require_cmd docker
+_require_cmd jq
+
+# ---- Validate site exists -------------------------------------------------
+SITE_JSON="$(_get_site "$SLUG")"
+if [[ -z "$SITE_JSON" || "$SITE_JSON" == "null" ]]; then
+    _die "site '$SLUG' not found in $STATE_FILE"
+fi
+
+DOMAIN="$(printf '%s' "$SITE_JSON" | jq -r '.domain // empty')"
+PORT="$(printf '%s' "$SITE_JSON" | jq -r '.port // empty')"
+REDIS_DB="$(printf '%s' "$SITE_JSON" | jq -r '.redis_db // empty')"
+
+[[ -n "$DOMAIN" ]] || DOMAIN="(unknown)"
+[[ -n "$PORT" ]]   || PORT="(unknown)"
+
+# ---- Confirmation ---------------------------------------------------------
+if (( ASSUME_YES == 0 )); then
+    if [[ ! -t 0 ]]; then
+        _die "non-interactive: pass --yes to delete site '$SLUG' ($DOMAIN)"
+    fi
+    printf 'Delete site %s (%s) — DB, files, secrets all removed. Type "yes" to confirm: ' \
+        "$SLUG" "$DOMAIN" >&2
+    read -r REPLY || REPLY=""
+    if [[ "$REPLY" != "yes" && "$REPLY" != "y" ]]; then
+        _log info "aborted; nothing changed"
+        exit 0
+    fi
+fi
+
+# ---- Tear-down sequence (best-effort; track failures) --------------------
+DB_DROP_FAILED=0
+FS_CLEANUP_FAILED=0
+
+# 1. Stop + remove container
+COMPOSE_FILE="${SITES_DIR}/${SLUG}/compose.yaml"
+if [[ -f "$COMPOSE_FILE" ]]; then
+    if ! docker compose -f "$COMPOSE_FILE" down --remove-orphans 2>&1; then
+        _log warn "compose down failed for $SLUG (continuing)"
+    fi
+else
+    _log warn "compose file not found at $COMPOSE_FILE (skipping compose down)"
+fi
+
+# 2. Drop DB + user (uses _db_drop_site helper)
+if ! _db_drop_site "$SLUG"; then
+    DB_DROP_FAILED=1
+    _log warn "DB drop reported errors for $SLUG"
+fi
+
+# 3. Remove site dir
+if [[ -d "${SITES_DIR}/${SLUG}" ]]; then
+    if ! rm -rf "${SITES_DIR}/${SLUG}"; then
+        FS_CLEANUP_FAILED=1
+        _log warn "rm -rf ${SITES_DIR}/${SLUG} failed"
+    fi
+fi
+
+# 4. Remove secrets file
+if [[ -f "${SECRETS_DIR}/${SLUG}.env" ]]; then
+    if ! rm -f "${SECRETS_DIR}/${SLUG}.env"; then
+        FS_CLEANUP_FAILED=1
+        _log warn "rm -f ${SECRETS_DIR}/${SLUG}.env failed"
+    fi
+fi
+
+# 5. Remove from sites.json
+if ! _state_remove_site "$SLUG"; then
+    _log warn "failed to remove $SLUG from $STATE_FILE"
+fi
+
+# ---- Render the Caddy block that was active (for cleanup) ----------------
+TEMPLATE_DIR="$(dirname "$0")/../templates"
+CADDY_TMPL="${TEMPLATE_DIR}/caddy-block.tmpl"
+CADDY_BLOCK=""
+if [[ -f "$CADDY_TMPL" ]]; then
+    CADDY_BLOCK="$(sed \
+        -e "s|{{domain}}|${DOMAIN}|g" \
+        -e "s|{{slug}}|${SLUG}|g" \
+        -e "s|{{port}}|${PORT}|g" \
+        -e "s|{{redis_db}}|${REDIS_DB}|g" \
+        "$CADDY_TMPL")"
+fi
+
+# ---- Output ---------------------------------------------------------------
+if _is_json_mode; then
+    jq -n \
+        --arg slug "$SLUG" \
+        --arg domain "$DOMAIN" \
+        --arg port "$PORT" \
+        --arg caddy_block "$CADDY_BLOCK" \
+        --arg status "deleted" \
+        '{slug: $slug, domain: $domain, port: $port, status: $status,
+          caddy_block: $caddy_block,
+          dns_row: {type: "A", name: "<subdomain_or_@>",
+                    content: "<vm_public_ip>", proxy: "Proxied"}}'
+else
+    printf '\n'
+    printf '✓ Site %s (%s) deleted.\n' "$SLUG" "$DOMAIN"
+    printf '\n── Manual cleanup ──\n'
+    printf '1. Remove the Caddy block for %s from your Caddyfile, then: sudo caddy reload\n' "$DOMAIN"
+    printf '2. Remove the Cloudflare DNS row for %s.\n' "$DOMAIN"
+    if [[ -n "$CADDY_BLOCK" ]]; then
+        printf '\nThe Caddy block that was active:\n'
+        printf '%s\n' "$CADDY_BLOCK"
+    fi
+    printf '\nCloudflare DNS row to remove:\n'
+    printf '  Type   Name                Content              Proxy\n'
+    printf '  A      <subdomain or @>    <your VM public IP>  Proxied\n'
+fi
+
+# Hard-fail only if BOTH critical cleanup paths failed.
+if (( DB_DROP_FAILED == 1 && FS_CLEANUP_FAILED == 1 )); then
+    _die "delete completed with errors: DB drop AND filesystem cleanup both failed"
+fi
+
+exit 0
