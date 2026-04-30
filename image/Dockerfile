@@ -18,11 +18,14 @@ COPY php.d-zz-wp.ini /usr/local/etc/php/conf.d/zz-wp.ini
 # php-fpm pool overrides (IMG-02, IMG-04, IMG-05).
 COPY fpm-zz-wp.conf /usr/local/etc/php-fpm.d/zz-wp.conf
 
-# IMG-06: run as www-data. The upstream Alpine image creates www-data at
-# UID/GID 82 (Alpine convention — NOT the Debian 33). We explicitly set USER
-# so `docker run` defaults to that UID. Phase 2's wp-create MUST chown bind
-# mounts to 82:82, not 33:33. See README "UID 82 (www-data)" section.
-USER www-data
+# IMG-06: per-site request handlers run as www-data (Alpine UID/GID 82, NOT
+# Debian 33). This is enforced at the FPM pool level (`user = www-data` in
+# fpm-zz-wp.conf), NOT via a top-level USER directive — because the upstream
+# entrypoint (docker-entrypoint.sh) MUST run as root on first boot to copy
+# WordPress core into /var/www/html and chown to www-data, then drops to
+# www-data via gosu when it execs php-fpm. Setting USER www-data here causes
+# the entrypoint to skip the WP setup and breaks `wp core install` in Phase 2.
+# Phase 2's wp-create MUST still chown bind mounts to 82:82.
 
 # Document the FPM port (already EXPOSEd by upstream, redeclared for clarity).
 EXPOSE 9000

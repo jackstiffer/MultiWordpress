@@ -11,10 +11,32 @@ future site provisioned by Phase 2's `wp-create`.
 ## Conventions Phase 2 must respect
 
 ### UID 82 (www-data) — IMG-06
-The container runs as `www-data`. **On Alpine, `www-data` is UID/GID 82** —
+PHP request handlers run as `www-data`. **On Alpine, `www-data` is UID/GID 82** —
 NOT 33 (which is the Debian convention some docs/REQUIREMENTS-IMG-06 imply).
-This is locked by HARD-03 (`wordpress:6-php8.3-fpm-alpine`) and is verifiable
-via `docker run --rm multiwp:wordpress-6-php8.3 id`.
+Locked by HARD-03 (`wordpress:6-php8.3-fpm-alpine`); verifiable via
+`docker run --rm --entrypoint id multiwp:wordpress-6-php8.3 -u www-data`.
+
+**Important — privilege drop happens at the FPM-pool layer, NOT at the
+Dockerfile USER directive.** The Dockerfile deliberately does NOT set
+`USER www-data` because the upstream entrypoint (`docker-entrypoint.sh`)
+MUST run as root on first boot to:
+1. Copy WordPress core from `/usr/src/wordpress/` to `/var/www/html/`
+2. `chown www-data:www-data /var/www/html/` recursively
+3. Then `exec gosu www-data php-fpm` to drop to www-data
+
+If you set `USER www-data` in the Dockerfile, the entrypoint runs as
+www-data, sees it's not root, and skips steps 1–2. Phase 2's
+`wp core install` then fails with "This does not seem to be a WordPress
+installation" because `/var/www/html` is empty.
+
+The actual privilege boundary lives in `fpm-zz-wp.conf`:
+```
+[www]
+user = www-data
+group = www-data
+```
+This pins every PHP-FPM worker to UID 82, regardless of how the container
+PID 1 was launched.
 
 When `wp-create` creates `/opt/wp/sites/<slug>/wp-content/`, it MUST
 `chown -R 82:82` the directory or the container will get "Permission denied"
