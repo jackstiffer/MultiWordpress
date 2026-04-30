@@ -147,16 +147,21 @@ else
     NEEDS[secrets]=1
 fi
 
-# wp.slice
-if systemctl list-unit-files 2>/dev/null | grep -q '^wp.slice'; then
-    if [ "$(cat /sys/fs/cgroup/wp.slice/memory.max 2>/dev/null)" = "4294967296" ]; then
+# wp.slice — check the file + the live cgroup directly. systemctl
+# list-unit-files doesn't reliably show slice units that omit [Install].
+if [ -f /etc/systemd/system/wp.slice ]; then
+    SLICE_MAX="$(cat /sys/fs/cgroup/wp.slice/memory.max 2>/dev/null || true)"
+    if [ "$SLICE_MAX" = "4294967296" ]; then
         ok "wp.slice installed and active (4 GB cap)"
+    elif [ -n "$SLICE_MAX" ]; then
+        miss "wp.slice unit installed but memory.max=$SLICE_MAX (expected 4294967296)"
+        NEEDS[wp_slice]=1
     else
-        miss "wp.slice systemd unit installed but memory.max != 4 GB"
+        miss "wp.slice unit file present but slice not active — try: sudo systemctl start wp.slice"
         NEEDS[wp_slice]=1
     fi
 else
-    miss "wp.slice not installed"
+    miss "wp.slice not installed (no /etc/systemd/system/wp.slice)"
     NEEDS[wp_slice]=1
 fi
 
