@@ -5,9 +5,21 @@ Lightweight, multi-site WordPress hosting for a single GCP VM that already runs 
 ## Status
 
 - **Phase 1 (Foundation): COMPLETE** — shared infra compose, per-site image template, and host `wp.slice` are all shipped and verifiable.
-- **Phase 2 (CLI Core + First Site E2E): COMPLETE** — all eight CLI verbs (`wp-create` / `wp-delete` / `wp-pause` / `wp-resume` / `wp-list` / `wp-stats` / `wp-logs` / `wp-exec`) shipped and locally smoke-tested. First-real-domain E2E runbook lives in [`docs/cli.md`](docs/cli.md) (operator-driven).
-- **Phase 3 (Operational Tooling): NEXT** — staggered host cron, `wp-metrics-poll` writing 24h rolling peaks to `metrics.json`, 5-site real-load validation.
-- Phase 4 (dashboard + docs) follows.
+- **Phase 2 (CLI Core + First Site E2E): COMPLETE (static + smoke)** — all eight CLI verbs shipped and smoke-tested. First-real-domain E2E runbook lives in [`docs/first-site-e2e.md`](docs/first-site-e2e.md) (operator-driven on the VM).
+- **Phase 3 (Operational Tooling): COMPLETE (static)** — `wp-metrics-poll` cron + per-site wp-cron stagger. Live verification on first VM deployment.
+- **Phase 4 (Polish — Dashboard + Docs): COMPLETE** — thin PHP dashboard (sudoers-whitelisted CLI bridge, no docker socket) + Caddy/Cloudflare runbook + scaling-cliff doc.
+
+**Milestone v1.0 complete.** First-site E2E (`cf-cache-status: HIT` validation) is the only operator-driven step remaining; everything else is static-verified and shippable.
+
+## Operating in Production
+
+- **Initial setup**: see the [Phase 1 Setup Runbook](#phase-1-setup-runbook) below.
+- **Provision your first site**: [docs/first-site-e2e.md](docs/first-site-e2e.md) — 8-step runbook proving `cf-cache-status: HIT`.
+- **Day-to-day operations**: [docs/cli.md](docs/cli.md) — full CLI reference.
+- **Cron + metrics**: [docs/operational.md](docs/operational.md) — install + verify the metrics-poll cron.
+- **Caddy + Cloudflare**: [docs/caddy-cloudflare.md](docs/caddy-cloudflare.md) — SSL modes, WAF rules, troubleshooting.
+- **Dashboard**: [dashboard/README.md](dashboard/README.md) — install + Caddy basic_auth setup.
+- **Scaling cliff**: [docs/scaling-cliff.md](docs/scaling-cliff.md) — when this single-VM design has been outgrown.
 
 ## Architecture
 
