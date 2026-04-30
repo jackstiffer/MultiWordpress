@@ -24,6 +24,7 @@ A lightweight, multi-site WordPress hosting setup that runs alongside existing N
 - [ ] CLI tool: `wp-list` — show all sites with status
 - [ ] CLI tool: `wp-stats` — system-wide + per-container CPU/mem/disk
 - [ ] CLI tools: `wp-pause` / `wp-resume` — stop a site's container to free its RAM (DB + files preserved), restart on resume; status surfaced in `wp-list`
+- [ ] Shared-pool memory model: all WP containers run under host systemd slice `wp.slice` (MemoryMax=4G); no per-site mem cap; sites burst freely into shared headroom; metrics tracked per site for observability
 - [ ] All container logs capped at 10 MB / 3 files (matches AudioStoryV2 pattern)
 - [ ] WordPress-internal logs (debug.log, php-fpm error log) also rotated to ~10 MB / 3 files
 - [ ] Stack stays under ~50% of host (≤ 1 vCPU, ≤ 4 GB RAM with 5+ sites at typical load)
@@ -51,7 +52,7 @@ A lightweight, multi-site WordPress hosting setup that runs alongside existing N
 - **Anti-pattern (rejected)**: EasyEngine — uses multiple containers per site (nginx + php-fpm + db + redis each, sometimes more). Resource cost compounds linearly with site count. Want shared infra instead.
 - **Site count**: 5 personal blogs today, expected to grow. All owned by the same person.
 - **Domains**: Each site gets its own custom domain. DNS is managed manually in Cloudflare. Caddy on host is configured manually per new site.
-- **Resource budget**: WP stack must fit in 50% of host = 1 vCPU + 4 GB RAM, leaving the rest for AudioStoryV2 and headroom.
+- **Resource budget**: WP stack must fit in 50% of host = 1 vCPU + 4 GB RAM, leaving the rest for AudioStoryV2 and headroom. Enforced at host cgroup level via `wp.slice` MemoryMax=4G; per-site containers have no individual memory cap.
 
 ## Constraints
 
@@ -68,6 +69,7 @@ A lightweight, multi-site WordPress hosting setup that runs alongside existing N
 | Decision | Rationale | Outcome |
 |----------|-----------|---------|
 | Per-site WordPress container, shared MariaDB + Redis | Balances isolation (own files, own DB user, own WP version) with resource efficiency (shared heavy services). Avoids EasyEngine bloat. | — Pending |
+| Shared memory pool via host `wp.slice` (MemoryMax=4G), no per-site mem cap | Simpler than tier system. Sites burst freely; pool-level cap protects AudioStoryV2. Trade-off accepted: one bad plugin can hog the pool — dashboard surfaces which site to investigate. | — Pending |
 | No reverse proxy in our stack | Host Caddy already exists and handles HTTPS + Cloudflare termination for the Next.js side. Adding `wp-caddy` would duplicate it. | — Pending |
 | CLI as source of truth, dashboard as thin viewer | Dashboard is optional polish; CLI must work without it. Avoids logic duplication. Internal-only tool — no auth complexity needed beyond Caddy basic auth. | — Pending |
 | Naming convention `wp-*` for every container | Lets `docker stats $(docker ps --filter name=wp- -q)` and similar one-liners cleanly scope the WP cluster. | — Pending |

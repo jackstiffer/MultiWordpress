@@ -16,24 +16,25 @@
 ### Phase 1: Foundation
 **Goal**: Shared infra and per-site image template are up, hardened, and verifiably budget-safe — every day-one pitfall is closed before any site is provisioned.
 **Depends on**: Nothing (first phase)
-**Requirements**: INFRA-01, INFRA-02, INFRA-03, INFRA-04, INFRA-05, INFRA-06, IMG-01, IMG-02, IMG-03, IMG-04, IMG-05, IMG-06, HARD-01, HARD-03
+**Requirements**: INFRA-01, INFRA-02, INFRA-03, INFRA-04, INFRA-05, INFRA-06, INFRA-07, IMG-01, IMG-02, IMG-03, IMG-04, IMG-05, IMG-06, HARD-01, HARD-03
 **Success Criteria** (what must be TRUE):
   1. Operator runs `docker compose -f compose/compose.yaml up -d` and `wp-mariadb` (`127.0.0.1:13306`) + `wp-redis` (`127.0.0.1:16379`) come up healthy on the `wp-network` bridge with MTU 1460, capped logs (10 MB / 3 files), and named volume for MariaDB data.
   2. `docker network inspect wp-network` confirms MTU 1460, and `ss -ltn` confirms no `wp-*` infra port binds to `0.0.0.0`.
-  3. `docker build` against the per-site Dockerfile produces an image based on `wordpress:6-php8.3-fpm-alpine` with WP-CLI baked in, php-fpm pool set to `pm=ondemand` / `max_children=6` / `idle_timeout=30s` / `max_requests=500`, OPcache 96 MB / JIT off / `memory_limit=256M`, and PHP execution denied under `wp-content/uploads/`.
+  3. `docker build` against the per-site Dockerfile produces an image based on `wordpress:6-php8.3-fpm-alpine` with WP-CLI baked in, php-fpm pool set to `pm=ondemand` / `max_children=10` / `idle_timeout=30s` / `max_requests=500`, OPcache 96 MB / JIT off / `memory_limit=256M`, and PHP execution denied under `wp-content/uploads/`.
   4. `docker run` of the per-site image runs as UID 33 (`www-data`); `WP_DEBUG_LOG` and php-fpm `error_log` both stream to `/proc/self/fd/2` so internal logs inherit the docker driver's rotation.
-  5. AudioStoryV2 stack is unaffected: `docker network ls` shows `wp-network` distinct from `audiostory_app-network`, no port conflicts on 3000/6379, and `docker stats` shows the WP infra cluster well under 1 GB resident at idle.
+  5. Host has cgroup v2 (`stat -fc %T /sys/fs/cgroup/` returns `cgroup2fs`); systemd unit `/etc/systemd/system/wp.slice` is installed with `MemoryMax=4G` and `CPUWeight=100`; `systemctl status wp.slice` shows it loaded; `cat /sys/fs/cgroup/wp.slice/memory.max` returns `4294967296`.
+  6. AudioStoryV2 stack is unaffected: `docker network ls` shows `wp-network` distinct from `audiostory_app-network`, no port conflicts on 3000/6379, no AudioStoryV2 containers in `wp.slice`, and `docker stats` shows the WP infra cluster well under 1 GB resident at idle.
 **Plans**: TBD
 
 ### Phase 2: CLI Core + First Site E2E
 **Goal**: A complete CLI provisions, lists, and tears down sites; the first real domain is live through the CLI and the Cloudflare + Super Page Cache strategy delivers near-static-file TTFB for logged-out reads.
 **Depends on**: Phase 1
-**Requirements**: CLI-01, CLI-02, CLI-03, CLI-04, CLI-05, CLI-06, CLI-08, CLI-09, CLI-10, CLI-11, CLI-14, CLI-15, CLI-16, CLI-17, STATE-01, STATE-02, STATE-03, STATE-04, PERF-01, PERF-02, HARD-02
+**Requirements**: CLI-01, CLI-02, CLI-03, CLI-04, CLI-05, CLI-06, CLI-08, CLI-09, CLI-10, CLI-11, CLI-14, CLI-17, STATE-01, STATE-02, STATE-03, STATE-04, PERF-01, PERF-02, HARD-02
 **Success Criteria** (what must be TRUE):
   1. Operator runs `wp-create blog.example.com`, pastes the printed Caddy block + Cloudflare DNS rows, and reaches a working WordPress admin at the printed URL — admin username is `admin_<8hex>`, XML-RPC is disabled, `redis-cache` plugin is active with per-site `WP_REDIS_DATABASE` + `WP_REDIS_PREFIX`, and creds persist to `/opt/wp/secrets/<slug>.env` (mode 600).
   2. `wp-create` is robust: re-running with the same slug errors cleanly (no silent overwrite); `--resume <slug>` continues from the last completed state-machine step; any mid-flow failure rolls back DB + dirs + container via `trap ERR`; port (18000+) and redis-DB allocation are serialized via lockfile; `SHOW GRANTS` confirms the DB user has access only to `wp_<slug>.*`.
-  3. `wp-list` shows all sites with slug/domain/status/tier/port/redis DB and distinguishes `running` vs `paused`; `wp-list --secrets <slug>` re-displays creds without leaking to shell history; `wp-stats` prints host CPU/mem/disk plus per-container stats for every `wp-*` including 24h-peak mem%/CPU%/DB-conn and tier-up flags (≥90% yellow, ≥100% red); `wp-logs <site> [--follow]` and `wp-exec <site> <wp-cli-args>` work; `wp-pause <site>` stops the container (RAM freed, DB + files + secrets intact, registry state = `paused`) and `wp-resume <site>` starts it back; `wp-delete` removes container + DB + user + secrets and prints exact Caddy/Cloudflare cleanup snippets.
-  4. Tiering works end-to-end: `wp-create blog --tier=large` provisions with `mem_limit=768m` + `pm.max_children=12` + DB `MAX_USER_CONNECTIONS=40`; `wp-tier blog xl` recreates the container with `mem_limit=1.5g` + `max_children=24` and re-issues the GRANT with `MAX_USER_CONNECTIONS=80`, in under 10s, with DB + files preserved; both refuse changes that would push cluster `mem_limit` total past 4 GB and name the sites to pause/downsize for budget.
+  3. `wp-list` shows all sites with slug/domain/status/port/redis DB/current mem/24h-peak mem and distinguishes `running` vs `paused`; `wp-list --secrets <slug>` re-displays creds without leaking to shell history; `wp-stats` prints a cluster line (`wp.slice` pool used / 4 GB total / 24h peak) and per-site rows sorted by 24h-peak mem; `wp-logs <site> [--follow]` and `wp-exec <site> <wp-cli-args>` work; `wp-pause <site>` stops the container (RAM freed, DB + files + secrets intact, registry state = `paused`) and `wp-resume <site>` starts it back; `wp-delete` removes container + DB + user + secrets and prints exact Caddy/Cloudflare cleanup snippets.
+  4. Shared-pool memory model is enforced: every `wp-<site>` container runs under `--cgroup-parent=wp.slice` with no per-container `--memory` flag; provisioning rejects compose definitions that try to set one. `cat /sys/fs/cgroup/wp.slice/memory.max` returns `4294967296` (4 GB). One-site burst on the first real domain consumes >1 GB without affecting AudioStoryV2 (separate cgroup; pool isolation verified).
   5. The first real domain proves the cache promise: after the operator pastes the documented Cloudflare Cache Rule (cookie-bypass for `wordpress_logged_in_*` / `wp-postpass_` / `comment_author_`) and activates Super Page Cache for Cloudflare, logged-out homepage requests return `cf-cache-status: HIT` with TTFB under ~100 ms, while logged-in admin requests bypass cache and hit origin.
 **Plans**: TBD
 
@@ -43,8 +44,8 @@
 **Requirements**: PERF-03, PERF-04
 **Success Criteria** (what must be TRUE):
   1. Every site provisioned in this phase has `DISABLE_WP_CRON=true` in its `wp-config.php`, and `crontab -l` on the host shows one staggered `wp cron event run --due-now` line per site (deterministic offset from slug-hash modulo) — `wp-stats` does not show a synchronized CPU spike at `:00` when 5+ sites are running.
-  2. `wp-metrics-poll` runs every minute, completes in under 200 ms, samples `docker stats` + per-site MariaDB connection count, and writes a rolling 24h peak per site (mem%, CPU%, DB conn) to `/opt/wp/state/metrics.json`. After 24h+ runtime, `wp-stats` reflects observed peaks; raising load on one site shows that site (and only that site) flagged as ≥ 90% on its tier.
-  3. With 5 real sites running at mixed tiers (e.g., 1 × `large` + 3 × `standard` + 1 × `small`) and Cloudflare absorbing logged-out reads, `docker stats` shows the WP cluster sustained under 2 GB resident and under 50% of one vCPU; AudioStoryV2 has not been OOM-killed or restarted.
+  2. `wp-metrics-poll` runs every minute, completes in under 200 ms, samples `docker stats` + per-site MariaDB connection count + `wp.slice/memory.current`, and writes rolling 24h peaks (cluster pool + per-site mem/CPU/DB-conn) to `/opt/wp/state/metrics.json`. After 24h+ runtime, `wp-stats` shows observed peaks; raising load on one site is reflected in that site's per-site row AND in the cluster pool line.
+  3. With 5 real sites running and Cloudflare absorbing logged-out reads, `wp.slice` pool stays sustained under 2 GB resident (50% of cap) under typical load; AudioStoryV2 has not been OOM-killed or restarted; one site's 24h-peak mem can exceed 1 GB without taking down others.
 **Plans**: TBD
 
 ### Phase 4: Polish — Dashboard + Docs
@@ -52,7 +53,7 @@
 **Depends on**: Phase 3
 **Requirements**: DASH-01, DASH-02, DASH-03, DOC-01, DOC-02, DOC-03
 **Success Criteria** (what must be TRUE):
-  1. Operator visits the dashboard URL behind host Caddy basic auth and sees a single-page table of every `wp-*` site with status, tier, current mem%, 24h-peak mem%, 24h-peak CPU%, 24h-peak DB-connection count, and a "view logs" modal — peaks ≥ 90% color-coded yellow ("tier-up suggested") and ≥ 100% red ("tier-up needed"). Refreshed by 5-second polling, no docker socket mounted into the dashboard container.
+  1. Operator visits the dashboard URL behind host Caddy basic auth and sees: (a) a cluster header — `wp.slice` pool used / 4 GB total, 24h peak %, AudioStoryV2 health; (b) a per-site table — status, current mem (MB), 24h-peak mem (MB), 24h-peak CPU%, 24h-peak DB-conn, "view logs" modal; sorted by 24h-peak mem descending. Pool peak ≥ 90% yellow, ≥ 100% red. Refreshed by 5-second polling, no docker socket mounted into the dashboard container.
   2. Dashboard "add site" and "delete site" buttons shell out to `wp-create` / `wp-delete` via a narrow sudoers whitelist (exact command lines, no shell metachars accepted), and `/var/log/auth.log` records each invocation.
   3. README walks a new operator from zero to a live site (prerequisites, Caddy + Cloudflare assumptions, full lifecycle); a Caddy snippet template + Cloudflare DNS row guide is included; a scaling-cliff doc names the four warning signs that this single-VM design has been outgrown.
 **Plans**: TBD
@@ -69,14 +70,14 @@
 
 ## Coverage
 
-**v1 requirements:** 38 total
-**Mapped:** 38 / 38 ✓
+**v1 requirements:** 37 total
+**Mapped:** 37 / 37 ✓
 **Unmapped:** 0
 
 | Phase | Requirement Count | Requirements |
 |-------|-------------------|--------------|
-| 1. Foundation | 14 | INFRA-01..06, IMG-01..06, HARD-01, HARD-03 |
-| 2. CLI Core + First Site E2E | 20 | CLI-01..06, CLI-08..11, CLI-14..17, STATE-01..04, PERF-01, PERF-02, HARD-02 |
+| 1. Foundation | 15 | INFRA-01..07, IMG-01..06, HARD-01, HARD-03 |
+| 2. CLI Core + First Site E2E | 17 | CLI-01..06, CLI-08..11, CLI-14, CLI-17, STATE-01..04, PERF-01, PERF-02, HARD-02 |
 | 3. Operational Tooling | 2 | PERF-03, PERF-04 |
 | 4. Polish — Dashboard + Docs | 6 | DASH-01..03, DOC-01..03 |
 
