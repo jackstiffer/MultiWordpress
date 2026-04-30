@@ -44,7 +44,13 @@ _pass() { CHECKS=$((CHECKS+1)); printf '  %s✓%s %s\n' "$GREEN" "$RESET" "$1"; 
 _fail() { FAILED=$((FAILED+1)); printf '  %sx%s %s\n' "$RED" "$RESET" "$1" >&2; }
 _section() { printf '\n%s== %s ==%s\n' "$YELLOW" "$1" "$RESET"; }
 
-VERBS=(wp-create wp-delete wp-pause wp-resume wp-list wp-stats wp-logs wp-exec)
+# Operator-facing CLI verbs — must respond to --help and reject no-args.
+OPERATOR_VERBS=(wp-create wp-delete wp-pause wp-resume wp-list wp-stats wp-logs wp-exec)
+# Non-operator scripts in bin/ (cron-invoked, etc.) — included in inventory
+# but skipped by --help / no-args checks.
+CRON_SCRIPTS=(wp-metrics-poll)
+# Union for the inventory check.
+VERBS=("${OPERATOR_VERBS[@]}" "${CRON_SCRIPTS[@]}")
 
 # -----------------------------------------------------------------------------
 # 1. bash -n on every file in bin/
@@ -152,7 +158,7 @@ SMOKE_WP_ROOT="$(mktemp -d -t wp-smoke-XXXXXX)"
 trap 'rm -rf "$SMOKE_WP_ROOT"' EXIT
 export WP_ROOT="$SMOKE_WP_ROOT"
 
-for verb in "${VERBS[@]}"; do
+for verb in "${OPERATOR_VERBS[@]}"; do
     path="${SCRIPT_DIR}/${verb}"
     [[ -x "$path" ]] || continue
 
@@ -204,7 +210,7 @@ shopt -u nullglob
 expected_sorted="$(printf '%s\n' "${VERBS[@]}" | sort | tr '\n' ' ')"
 found_sorted="$(printf '%s\n' "${found[@]}" | sort | tr '\n' ' ')"
 if [[ "$expected_sorted" == "$found_sorted" ]]; then
-    _pass "verb set matches Phase 2 spec (8 verbs)"
+    _pass "verb set matches spec (${#VERBS[@]} verbs: 8 operator + 1 cron)"
 else
     _fail "verb set mismatch: expected [$expected_sorted], got [$found_sorted]"
 fi
