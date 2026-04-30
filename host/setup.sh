@@ -134,13 +134,9 @@ else
     NEEDS[docker]=1
 fi
 
-# Caddy
-if command -v caddy >/dev/null 2>&1; then
-    ok "Caddy installed ($(caddy version | head -1 | awk '{print $1}'))"
-else
-    miss "Caddy missing"
-    NEEDS[caddy]=1
-fi
+# Caddy intentionally NOT checked or managed here.
+# Host Caddy is the operator's responsibility (shared with AudioStoryV2);
+# this stack prints snippets to paste and never edits Caddyfile programmatically.
 
 # .env / secrets
 if [ -f "$WP_ROOT/.env" ] && grep -qE '^MARIADB_ROOT_PASSWORD=[^[:space:]]' "$WP_ROOT/.env" \
@@ -229,7 +225,6 @@ else
     echo "  Missing items will be set up if you confirm each:"
     [ -n "${NEEDS[base]:-}" ]         && echo "    • install base packages (curl jq openssl etc.)"
     [ -n "${NEEDS[docker]:-}" ]       && echo "    • install Docker Engine + Compose plugin"
-    [ -n "${NEEDS[caddy]:-}" ]        && echo "    • install Caddy"
     [ -n "${NEEDS[secrets]:-}" ]      && echo "    • generate /opt/wp/.env (MARIADB_ROOT_PASSWORD)"
     [ -n "${NEEDS[wp_slice]:-}" ]     && echo "    • install host/wp.slice systemd unit (4 GB cap)"
     [ -n "${NEEDS[infra]:-}" ]        && echo "    • bring up shared infra (wp-mariadb + wp-redis)"
@@ -273,25 +268,6 @@ if [ -n "${NEEDS[docker]:-}" ]; then
         ok "Docker installed: $(docker --version)"
     else
         warn "skipped — most subsequent steps will fail without Docker"
-    fi
-fi
-
-if [ -n "${NEEDS[caddy]:-}" ]; then
-    step_banner "Install Caddy (host reverse proxy)"
-    echo "  Caddy is the host-level reverse proxy in front of WP sites + dashboard."
-    echo "  This stack does NOT bring its own — host Caddy must exist."
-    if confirm "Install Caddy?"; then
-        apt install -y debian-keyring debian-archive-keyring apt-transport-https
-        curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
-            | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-        curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
-            > /etc/apt/sources.list.d/caddy-stable.list
-        apt update
-        apt install -y caddy
-        systemctl enable --now caddy
-        ok "Caddy installed: $(caddy version | head -1)"
-    else
-        warn "skipped — you'll need a reverse proxy before sites are reachable"
     fi
 fi
 
