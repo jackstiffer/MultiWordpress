@@ -32,15 +32,21 @@ define('WP_REDIS_HOST',     getenv('WORDPRESS_REDIS_HOST'));
 define('WP_REDIS_DATABASE', (int) getenv('WORDPRESS_REDIS_DATABASE'));
 define('WP_REDIS_PREFIX',   getenv('WORDPRESS_REDIS_PREFIX'));
 
-// --- WordPress secret keys / salts (from .env) ---------------------
-define('AUTH_KEY',         getenv('WP_AUTH_KEY'));
-define('SECURE_AUTH_KEY',  getenv('WP_SECURE_AUTH_KEY'));
-define('LOGGED_IN_KEY',    getenv('WP_LOGGED_IN_KEY'));
-define('NONCE_KEY',        getenv('WP_NONCE_KEY'));
-define('AUTH_SALT',        getenv('WP_AUTH_SALT'));
-define('SECURE_AUTH_SALT', getenv('WP_SECURE_AUTH_SALT'));
-define('LOGGED_IN_SALT',   getenv('WP_LOGGED_IN_SALT'));
-define('NONCE_SALT',       getenv('WP_NONCE_SALT'));
+// --- WordPress secret keys / salts ---------------------------------
+// The upstream wordpress:fpm-alpine entrypoint already writes salts
+// into wp-config.php on first boot — either from WORDPRESS_AUTH_KEY
+// env vars (if set) or random generation. Our `if (!defined())` guards
+// prevent redefinition warnings. The salts in our per-site .env are
+// reserved for future use (e.g., if we ever switch to writing
+// wp-config.php ourselves to make the salts persistent across reseeds).
+if (!defined('AUTH_KEY'))         define('AUTH_KEY',         getenv('WP_AUTH_KEY')         ?: '');
+if (!defined('SECURE_AUTH_KEY'))  define('SECURE_AUTH_KEY',  getenv('WP_SECURE_AUTH_KEY')  ?: '');
+if (!defined('LOGGED_IN_KEY'))    define('LOGGED_IN_KEY',    getenv('WP_LOGGED_IN_KEY')    ?: '');
+if (!defined('NONCE_KEY'))        define('NONCE_KEY',        getenv('WP_NONCE_KEY')        ?: '');
+if (!defined('AUTH_SALT'))        define('AUTH_SALT',        getenv('WP_AUTH_SALT')        ?: '');
+if (!defined('SECURE_AUTH_SALT')) define('SECURE_AUTH_SALT', getenv('WP_SECURE_AUTH_SALT') ?: '');
+if (!defined('LOGGED_IN_SALT'))   define('LOGGED_IN_SALT',   getenv('WP_LOGGED_IN_SALT')   ?: '');
+if (!defined('NONCE_SALT'))       define('NONCE_SALT',       getenv('WP_NONCE_SALT')       ?: '');
 
 // --- Debug: production defaults (off) ------------------------------
 if (!defined('WP_DEBUG'))         define('WP_DEBUG', false);
