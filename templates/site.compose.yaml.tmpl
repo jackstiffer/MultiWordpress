@@ -1,0 +1,49 @@
+# Per-site Docker Compose — rendered by wp-create.
+# Placeholders: {{slug}}, {{port}}, {{redis_db}}, {{domain}}
+#
+# IMPORTANT: This file intentionally has NO per-container memory cap
+# (no `mem-limit`-style directive, no `--memory` flag). The shared cgroup
+# `wp.slice` (cgroup_parent below) is the ONLY memory ceiling for
+# WordPress sites. Adding per-container caps breaks the shared-pool
+# model (HARD-02 / INFRA-05).
+
+services:
+  wp-{{slug}}:
+    image: multiwp:wordpress-6-php8.3
+    container_name: wp-{{slug}}
+    cgroup_parent: wp.slice           # SHARED POOL — no per-container cap
+    networks:
+      - wp-network
+    ports:
+      - "127.0.0.1:{{port}}:9000"     # FastCGI on loopback (HARD-01)
+    env_file:
+      - /opt/wp/secrets/{{slug}}.env
+    environment:
+      WORDPRESS_DB_HOST: wp-mariadb:3306
+      WORDPRESS_DB_NAME: ${DB_NAME}
+      WORDPRESS_DB_USER: ${DB_USER}
+      WORDPRESS_DB_PASSWORD: ${DB_PASSWORD}
+      WORDPRESS_REDIS_HOST: wp-redis
+      WORDPRESS_REDIS_DATABASE: ${REDIS_DB}
+      WORDPRESS_REDIS_PREFIX: wp_{{slug}}_
+      WORDPRESS_HOME: https://{{domain}}
+      WORDPRESS_SITEURL: https://{{domain}}
+    volumes:
+      - /opt/wp/sites/{{slug}}/wp-content:/var/www/html/wp-content
+    restart: unless-stopped
+    # NOTE: shared infra (wp-mariadb, wp-redis) lives in a SEPARATE compose
+    # project (compose/compose.yaml). Docker Compose `depends_on` cannot
+    # reference services in other projects, so we rely on the shared
+    # `wp-network` for service discovery — wp-create asserts the shared
+    # infra is healthy before launching a per-site compose.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+        compress: "true"
+
+networks:
+  wp-network:
+    external: true
+    name: wp-network

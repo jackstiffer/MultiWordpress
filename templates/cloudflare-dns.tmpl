@@ -1,0 +1,10 @@
+# Cloudflare DNS rows for {{domain}}
+#
+# wp-create derives {{subdomain_or_at}} from the domain:
+#   - apex (example.com)         → "@"
+#   - subdomain (blog.example.com) → "blog"
+# {{vm_public_ip}} is your GCP VM's external IP.
+
+── Cloudflare DNS rows ──
+Type   Name                      Content              Proxy
+A      {{subdomain_or_at}}       {{vm_public_ip}}     Proxied

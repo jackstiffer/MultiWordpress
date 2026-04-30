@@ -1,0 +1,57 @@
+<?php
+// MultiWordpress hardening — injected by wp-create above the
+// "/* That's all, stop editing! */" line in wp-config.php.
+//
+// No {{placeholders}} here — runtime values come from the per-site
+// .env file (loaded by Docker into the container's environment).
+
+// --- XML-RPC disabled (HARD-02) ------------------------------------
+// The authoritative block happens at the edge: Caddy returns 403 for
+// /xmlrpc.php (see templates/caddy-block.tmpl). The filters below are
+// belt-and-suspenders for any code path that bypasses Caddy (e.g.
+// internal cron, debug shells). XMLRPC_REQUEST signals intent to
+// plugins that honor it.
+add_filter('xmlrpc_enabled', '__return_false');
+add_filter('wp_headers', function ($headers) {
+    unset($headers['X-Pingback']);
+    return $headers;
+});
+if (!defined('XMLRPC_REQUEST')) {
+    define('XMLRPC_REQUEST', false);
+}
+
+// --- Cron: host-driven, staggered (Phase 3) ------------------------
+define('DISABLE_WP_CRON', true);
+
+// --- WP_HOME / WP_SITEURL from environment -------------------------
+if (!defined('WP_HOME'))    define('WP_HOME',    getenv('WORDPRESS_HOME'));
+if (!defined('WP_SITEURL')) define('WP_SITEURL', getenv('WORDPRESS_SITEURL'));
+
+// --- Redis object cache: per-site DB index + key prefix (PERF-01) --
+define('WP_REDIS_HOST',     getenv('WORDPRESS_REDIS_HOST'));
+define('WP_REDIS_DATABASE', (int) getenv('WORDPRESS_REDIS_DATABASE'));
+define('WP_REDIS_PREFIX',   getenv('WORDPRESS_REDIS_PREFIX'));
+
+// --- WordPress secret keys / salts (from .env) ---------------------
+define('AUTH_KEY',         getenv('WP_AUTH_KEY'));
+define('SECURE_AUTH_KEY',  getenv('WP_SECURE_AUTH_KEY'));
+define('LOGGED_IN_KEY',    getenv('WP_LOGGED_IN_KEY'));
+define('NONCE_KEY',        getenv('WP_NONCE_KEY'));
+define('AUTH_SALT',        getenv('WP_AUTH_SALT'));
+define('SECURE_AUTH_SALT', getenv('WP_SECURE_AUTH_SALT'));
+define('LOGGED_IN_SALT',   getenv('WP_LOGGED_IN_SALT'));
+define('NONCE_SALT',       getenv('WP_NONCE_SALT'));
+
+// --- Debug: production defaults (off) ------------------------------
+if (!defined('WP_DEBUG'))         define('WP_DEBUG', false);
+if (!defined('WP_DEBUG_DISPLAY')) define('WP_DEBUG_DISPLAY', false);
+if (!defined('WP_DEBUG_LOG'))     define('WP_DEBUG_LOG', false);
+
+// To enable debug logging, uncomment and set WP_DEBUG=true. Logs go
+// to fd/2 (container stderr) so docker's json-file driver picks them
+// up — no on-disk debug.log to forget about.
+//
+// define('WP_DEBUG', true);
+// define('WP_DEBUG_LOG', '/proc/self/fd/2');
+// define('WP_DEBUG_DISPLAY', false);
+// @ini_set('display_errors', '0');
