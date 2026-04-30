@@ -1,0 +1,369 @@
+#!/usr/bin/env bash
+# =============================================================================
+# bin/wp-stats — cluster + per-site stats with peak tracking
+# =============================================================================
+#
+# Usage:
+#   wp-stats               # human-readable cluster header + per-site rows
+#   wp-stats --json        # structured JSON
+#
+# Cluster header includes:
+#   - wp.slice memory pool (current, max, 24h peak from metrics.json)
+#   - AudioStoryV2 container health (best-effort, non-fatal)
+#   - Disk usage on /opt/wp
+#
+# Per-site rows: MEM-NOW, MEM-PEAK-24H, CPU-PEAK-24H, DB-CONN-NOW (or peak if
+# available in metrics.json). Sorted by MEM-PEAK-24H descending.
+#
+# Plan:    .planning/phases/02-cli-core-first-site-e2e/02-PLAN-05-wp-list-stats-logs-exec.md
+# Context: .planning/phases/02-cli-core-first-site-e2e/02-CONTEXT.md (wp-stats)
+# =============================================================================
+
+set -euo pipefail
+
+READ_ONLY=1
+# shellcheck source=_lib.sh
+source "$(dirname "$0")/_lib.sh"
+
+CGROUP_CURRENT="/sys/fs/cgroup/wp.slice/memory.current"
+CGROUP_MAX="/sys/fs/cgroup/wp.slice/memory.max"
+
+_usage() {
+    cat <<EOF
+Usage: wp-stats [--json] [-h|--help]
+
+Prints cluster-level stats (wp.slice memory pool, AudioStoryV2 health, /opt/wp
+disk usage) followed by per-site rows sorted by 24h peak memory.
+
+Options:
+  --json        Emit structured JSON instead of human-readable output.
+  -h, --help    Show this help.
+
+Color thresholds (cluster pool peak vs MemoryMax):
+  >= 100%   red
+  >=  90%   yellow
+  else      default
+
+Honors NO_COLOR and isatty(stderr) — colors auto-disable in pipes.
+
+When /opt/wp/state/metrics.json is absent (Phase 2 normal state, before
+wp-metrics-poll ships in Phase 3) all 24h peaks render as "-" and a one-line
+note is emitted.
+EOF
+}
+
+JSON_OUT=0
+while (( $# )); do
+    case "$1" in
+        --json)    JSON_OUT=1; shift ;;
+        -h|--help) _usage; exit 0 ;;
+        *)         _die "wp-stats: unknown argument: $1" ;;
+    esac
+done
+
+_require_cmd jq
+_require_cmd docker
+
+# -----------------------------------------------------------------------------
+# Cluster: wp.slice pool
+# -----------------------------------------------------------------------------
+pool_used_now_bytes=0
+pool_max_bytes=0
+if [[ -r "$CGROUP_CURRENT" ]]; then
+    pool_used_now_bytes="$(cat "$CGROUP_CURRENT" 2>/dev/null || printf 0)"
+else
+    _log warn "cannot read $CGROUP_CURRENT (cluster pool 'now' will show 0)"
+fi
+if [[ -r "$CGROUP_MAX" ]]; then
+    raw="$(cat "$CGROUP_MAX" 2>/dev/null || printf 0)"
+    # cgroup v2 may emit literal "max"
+    if [[ "$raw" == "max" ]]; then
+        pool_max_bytes=0
+    else
+        pool_max_bytes="$raw"
+    fi
+fi
+
+metrics_present=0
+[[ -f "$METRICS_FILE" ]] && metrics_present=1
+
+pool_peak_24h_bytes="-"
+if (( metrics_present == 1 )); then
+    raw="$(jq -r '.cluster.pool_used_peak_bytes // empty' "$METRICS_FILE" 2>/dev/null || true)"
+    [[ -n "$raw" && "$raw" != "null" ]] && pool_peak_24h_bytes="$raw"
+fi
+
+# Compute MB + percentages
+_bytes_to_mb() { awk -v b="${1:-0}" 'BEGIN { printf("%d", (b/1048576) + 0.5) }'; }
+_bytes_to_gb() { awk -v b="${1:-0}" 'BEGIN { printf("%.2f", b/1073741824) }'; }
+
+pool_used_now_mb="$(_bytes_to_mb "$pool_used_now_bytes")"
+pool_max_mb="$(_bytes_to_mb "$pool_max_bytes")"
+pool_used_now_gb="$(_bytes_to_gb "$pool_used_now_bytes")"
+pool_max_gb="$(_bytes_to_gb "$pool_max_bytes")"
+
+pool_pct_now="-"
+if (( pool_max_bytes > 0 )); then
+    pool_pct_now="$(awk -v u="$pool_used_now_bytes" -v m="$pool_max_bytes" \
+        'BEGIN { printf("%.0f", (u/m)*100) }')"
+fi
+pool_pct_peak="-"
+if [[ "$pool_peak_24h_bytes" != "-" ]] && (( pool_max_bytes > 0 )); then
+    pool_pct_peak="$(awk -v u="$pool_peak_24h_bytes" -v m="$pool_max_bytes" \
+        'BEGIN { printf("%.0f", (u/m)*100) }')"
+fi
+
+# Pick color for the cluster pool peak line.
+_pool_color() {
+    local pct="$1"
+    [[ "$pct" == "-" ]] && { printf '%s' ""; return 0; }
+    if   (( pct >= 100 )); then printf '%s' "$RED"
+    elif (( pct >= 90  )); then printf '%s' "$YELLOW"
+    else                        printf '%s' ""
+    fi
+}
+peak_color="$(_pool_color "$pool_pct_peak")"
+
+# -----------------------------------------------------------------------------
+# AudioStoryV2 health (best-effort)
+# -----------------------------------------------------------------------------
+audiostory_name=""
+audiostory_status="not detected"
+audiostory_restarts="-"
+for candidate in audiostory-web audiostory_web audiostory_web_1 audiostory; do
+    if docker inspect "$candidate" >/dev/null 2>&1; then
+        audiostory_name="$candidate"
+        break
+    fi
+done
+# Fall back to a substring match if no exact-name candidate hit.
+if [[ -z "$audiostory_name" ]]; then
+    match="$(docker ps -a --filter 'name=audiostory' --format '{{.Names}}' | head -n1 || true)"
+    [[ -n "$match" ]] && audiostory_name="$match"
+fi
+if [[ -n "$audiostory_name" ]]; then
+    audiostory_status="$(docker inspect --format '{{.State.Status}}' "$audiostory_name" 2>/dev/null || printf 'unknown')"
+    audiostory_restarts="$(docker inspect --format '{{.RestartCount}}' "$audiostory_name" 2>/dev/null || printf -- '-')"
+fi
+
+# -----------------------------------------------------------------------------
+# Disk usage on /opt/wp (best-effort)
+# -----------------------------------------------------------------------------
+disk_pct="-"
+disk_used="-"
+disk_total="-"
+if [[ -d "$WP_ROOT" ]] && command -v df >/dev/null 2>&1; then
+    df_line="$(df -h "$WP_ROOT" 2>/dev/null | awk 'NR==2 {print $3, $2, $5}')"
+    if [[ -n "$df_line" ]]; then
+        read -r disk_used disk_total disk_pct <<< "$df_line"
+    fi
+fi
+
+# -----------------------------------------------------------------------------
+# Per-site rows
+# -----------------------------------------------------------------------------
+state_json="$(_load_state)"
+
+docker_stats_raw=""
+docker_stats_raw="$(docker stats --no-stream --format '{{.Name}} {{.MemUsage}} {{.CPUPerc}}' 2>/dev/null || true)"
+
+_lookup_mem_bytes() {
+    local cname="$1" line raw num unit
+    line="$(printf '%s\n' "$docker_stats_raw" | awk -v n="$cname" '$1==n {print $2; exit}')"
+    [[ -n "$line" ]] || { printf '%s' "-"; return 0; }
+    raw="$line"
+    if [[ "$raw" =~ ^([0-9]+(\.[0-9]+)?)([A-Za-z]+)$ ]]; then
+        num="${BASH_REMATCH[1]}"; unit="${BASH_REMATCH[3]}"
+    else
+        printf '%s' "-"; return 0
+    fi
+    awk -v n="$num" -v u="$unit" 'BEGIN {
+        u=tolower(u);
+        if (u=="b")                  b = n;
+        else if (u=="kib" || u=="kb") b = n * 1024;
+        else if (u=="mib" || u=="mb") b = n * 1048576;
+        else if (u=="gib" || u=="gb") b = n * 1073741824;
+        else if (u=="tib" || u=="tb") b = n * 1099511627776;
+        else                          b = n;
+        printf("%d", b + 0.5);
+    }'
+}
+
+_docker_running() {
+    local cname="$1"
+    [[ "$(docker inspect --format '{{.State.Status}}' "$cname" 2>/dev/null)" == "running" ]]
+}
+
+# Best-effort live DB-conn snapshot grouped per slug.
+declare -A db_conn_now
+db_conn_collected=0
+_collect_db_conn_snapshot() {
+    (( db_conn_collected == 1 )) && return 0
+    db_conn_collected=1
+    local out
+    if out="$(_db_exec "SELECT user, COUNT(*) FROM information_schema.processlist WHERE user LIKE 'wp_%' GROUP BY user;" 2>/dev/null)"; then
+        # Parse two-column tab-separated output (skip header).
+        while IFS=$'\t' read -r user cnt; do
+            [[ "$user" == "user" || -z "$user" ]] && continue
+            slug="${user#wp_}"
+            db_conn_now["$slug"]="$cnt"
+        done <<< "$out"
+    fi
+}
+
+declare -a rows_with_peak rows_no_peak
+all_slugs="$(printf '%s' "$state_json" | jq -r '.sites | keys[]?' 2>/dev/null || true)"
+
+while IFS= read -r slug; do
+    [[ -n "$slug" ]] || continue
+    domain="$(printf '%s' "$state_json" | jq -r --arg s "$slug" '.sites[$s].domain // "-"')"
+    cname="wp-${slug}"
+    if _docker_running "$cname"; then
+        mem_now_bytes="$(_lookup_mem_bytes "$cname")"
+    else
+        mem_now_bytes="-"
+    fi
+    mem_peak_bytes="-"
+    cpu_peak_pct="-"
+    db_conn_peak="-"
+    if (( metrics_present == 1 )); then
+        v="$(jq -r --arg s "$slug" '.sites[$s].mem_peak_bytes // empty' "$METRICS_FILE" 2>/dev/null || true)"
+        [[ -n "$v" && "$v" != "null" ]] && mem_peak_bytes="$v"
+        v="$(jq -r --arg s "$slug" '.sites[$s].cpu_peak_pct // empty' "$METRICS_FILE" 2>/dev/null || true)"
+        [[ -n "$v" && "$v" != "null" ]] && cpu_peak_pct="$v"
+        v="$(jq -r --arg s "$slug" '.sites[$s].db_conn_peak // empty' "$METRICS_FILE" 2>/dev/null || true)"
+        [[ -n "$v" && "$v" != "null" ]] && db_conn_peak="$v"
+    fi
+
+    # DB-conn fallback: live snapshot (NOT a 24h peak — disclaimer in output).
+    _collect_db_conn_snapshot
+    db_conn_now_val="${db_conn_now[$slug]:--}"
+
+    # Convert bytes → MB for display
+    if [[ "$mem_now_bytes"  != "-" ]]; then mem_now_mb="$(_bytes_to_mb "$mem_now_bytes")";   else mem_now_mb="-";  fi
+    if [[ "$mem_peak_bytes" != "-" ]]; then mem_peak_mb="$(_bytes_to_mb "$mem_peak_bytes")"; else mem_peak_mb="-"; fi
+
+    sort_key="$mem_peak_bytes"
+    row="${slug}|${domain}|${mem_now_mb}|${mem_peak_mb}|${cpu_peak_pct}|${db_conn_now_val}|${db_conn_peak}|${sort_key}|${mem_now_bytes}|${mem_peak_bytes}"
+    if [[ "$sort_key" == "-" ]]; then
+        rows_no_peak+=("$row")
+    else
+        rows_with_peak+=("$row")
+    fi
+done <<< "$all_slugs"
+
+sorted_with_peak=()
+if (( ${#rows_with_peak[@]} > 0 )); then
+    while IFS= read -r line; do
+        sorted_with_peak+=("$line")
+    done < <(printf '%s\n' "${rows_with_peak[@]}" | sort -t'|' -k8,8nr)
+fi
+all_rows=("${sorted_with_peak[@]}" "${rows_no_peak[@]}")
+
+# -----------------------------------------------------------------------------
+# JSON output
+# -----------------------------------------------------------------------------
+if (( JSON_OUT == 1 )); then
+    out='{}'
+    out="$(printf '%s' "$out" | jq \
+        --arg pun "$pool_used_now_bytes" --arg pmx "$pool_max_bytes" \
+        --arg pp  "$pool_peak_24h_bytes" \
+        --arg ppn "$pool_pct_now" --arg ppp "$pool_pct_peak" \
+        '.cluster = {
+            pool_used_now_bytes: ($pun | tonumber? // 0),
+            pool_max_bytes:      ($pmx | tonumber? // 0),
+            pool_peak_24h_bytes: ($pp  | tonumber? // null),
+            pool_pct_now:        ($ppn | tonumber? // null),
+            pool_pct_peak:       ($ppp | tonumber? // null)
+        }')"
+    out="$(printf '%s' "$out" | jq \
+        --arg name "$audiostory_name" --arg st "$audiostory_status" --arg rc "$audiostory_restarts" \
+        '.audiostory = {
+            detected: ($name != ""),
+            container: (if $name == "" then null else $name end),
+            status:    $st,
+            restart_count: ($rc | tonumber? // null)
+        }')"
+    out="$(printf '%s' "$out" | jq \
+        --arg used "$disk_used" --arg total "$disk_total" --arg pct "$disk_pct" \
+        '.disk = { used: $used, total: $total, percent_used: $pct }')"
+    out="$(printf '%s' "$out" | jq '.metrics_json_present = '"$( ((metrics_present==1)) && echo true || echo false )")"
+    out="$(printf '%s' "$out" | jq '.sites = []')"
+    for row in "${all_rows[@]}"; do
+        IFS='|' read -r slug domain mem_now_mb mem_peak_mb cpu_peak db_now db_peak sk mem_now_bytes mem_peak_bytes <<< "$row"
+        out="$(printf '%s' "$out" | jq \
+            --arg slug "$slug" --arg domain "$domain" \
+            --arg mn "$mem_now_bytes" --arg mp "$mem_peak_bytes" \
+            --arg cp "$cpu_peak" --arg dn "$db_now" --arg dp "$db_peak" \
+            '.sites += [{
+                slug: $slug,
+                domain: $domain,
+                current_mem_bytes:  ($mn | tonumber? // null),
+                peak_mem_bytes_24h: ($mp | tonumber? // null),
+                peak_cpu_pct_24h:   ($cp | tonumber? // null),
+                db_conn_now:        ($dn | tonumber? // null),
+                peak_db_conn_24h:   ($dp | tonumber? // null)
+            }]')"
+    done
+    printf '%s\n' "$out" | jq .
+    exit 0
+fi
+
+# -----------------------------------------------------------------------------
+# Human output
+# -----------------------------------------------------------------------------
+
+# Cluster header
+printf '== Cluster ==\n'
+if (( pool_max_bytes > 0 )); then
+    if [[ "$pool_peak_24h_bytes" == "-" ]]; then
+        printf 'wp.slice pool: %s GB used / %s GB total (%s%%) — 24h peak: -\n' \
+            "$pool_used_now_gb" "$pool_max_gb" "$pool_pct_now"
+    else
+        peak_gb="$(_bytes_to_gb "$pool_peak_24h_bytes")"
+        printf '%swp.slice pool: %s GB used / %s GB total (%s%%) — 24h peak %s GB (%s%%)%s\n' \
+            "$peak_color" "$pool_used_now_gb" "$pool_max_gb" "$pool_pct_now" \
+            "$peak_gb" "$pool_pct_peak" "$RESET"
+    fi
+else
+    printf 'wp.slice pool: cgroup unreadable (run as root or check /sys/fs/cgroup/wp.slice)\n'
+fi
+
+if [[ -n "$audiostory_name" ]]; then
+    printf 'AudioStoryV2: %s — %s (restarts=%s)\n' \
+        "$audiostory_name" "$audiostory_status" "$audiostory_restarts"
+else
+    printf 'AudioStoryV2: (not detected)\n'
+fi
+printf 'Disk /opt/wp: %s used / %s total (%s)\n\n' "$disk_used" "$disk_total" "$disk_pct"
+
+# Per-site
+if (( ${#all_rows[@]} == 0 )); then
+    printf 'No sites registered.\n'
+    exit 0
+fi
+
+if (( metrics_present == 0 )); then
+    printf '(24h peaks unavailable — wp-metrics-poll not yet running; ships in Phase 3)\n\n'
+    printf '%-20s %-30s %-10s %s\n' "SLUG" "DOMAIN" "MEM-NOW" "DB-CONN-NOW"
+    for row in "${all_rows[@]}"; do
+        IFS='|' read -r slug domain mem_now_mb mem_peak_mb cpu_peak db_now db_peak sk mn_b mp_b <<< "$row"
+        mn_disp="$mem_now_mb"
+        [[ "$mem_now_mb" != "-" ]] && mn_disp="${mem_now_mb} MB"
+        printf '%-20s %-30s %-10s %s\n' "$slug" "$domain" "$mn_disp" "$db_now"
+    done
+    printf '\nNote: DB-CONN-NOW is a live snapshot, not a 24h peak.\n'
+    exit 0
+fi
+
+printf '%-20s %-30s %-10s %-12s %-10s %s\n' \
+    "SLUG" "DOMAIN" "MEM-NOW" "MEM-PEAK-24H" "CPU-PEAK" "DB-CONN-NOW"
+for row in "${all_rows[@]}"; do
+    IFS='|' read -r slug domain mem_now_mb mem_peak_mb cpu_peak db_now db_peak sk mn_b mp_b <<< "$row"
+    mn_disp="$mem_now_mb";   [[ "$mem_now_mb"  != "-" ]] && mn_disp="${mem_now_mb} MB"
+    mp_disp="$mem_peak_mb";  [[ "$mem_peak_mb" != "-" ]] && mp_disp="${mem_peak_mb} MB"
+    cp_disp="$cpu_peak";     [[ "$cpu_peak"    != "-" ]] && cp_disp="${cpu_peak}%"
+    printf '%-20s %-30s %-10s %-12s %-10s %s\n' \
+        "$slug" "$domain" "$mn_disp" "$mp_disp" "$cp_disp" "$db_now"
+done
+printf '\nNote: DB-CONN-NOW is a live snapshot, not a 24h peak.\n'

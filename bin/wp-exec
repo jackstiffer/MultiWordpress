@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# =============================================================================
+# bin/wp-exec — pure passthrough to WP-CLI inside a site container
+# =============================================================================
+#
+# Usage:
+#   wp-exec <slug> <wp-cli-args...>
+#
+# Examples:
+#   wp-exec myblog plugin list
+#   wp-exec myblog user list --role=administrator
+#   wp-exec myblog core update
+#
+# Exits with the wp-cli container exit code. Uses `exec docker exec` so signals
+# (SIGINT, SIGTERM) propagate cleanly to wp-cli inside the container.
+#
+# Plan:    .planning/phases/02-cli-core-first-site-e2e/02-PLAN-05-wp-list-stats-logs-exec.md
+# Context: .planning/phases/02-cli-core-first-site-e2e/02-CONTEXT.md (wp-exec)
+# =============================================================================
+
+set -euo pipefail
+
+READ_ONLY=1
+# shellcheck source=_lib.sh
+source "$(dirname "$0")/_lib.sh"
+
+_usage() {
+    cat <<EOF
+Usage: wp-exec <slug> <wp-cli-args...> [-h|--help]
+
+Pure passthrough to WP-CLI inside the wp-<slug> container, running as
+www-data (UID 82). All arguments after <slug> are forwarded verbatim.
+
+Examples:
+  wp-exec myblog plugin list
+  wp-exec myblog user list --role=administrator
+  wp-exec myblog redis status
+  wp-exec myblog core update
+
+The site must be running. Use wp-resume <slug> first if it is paused.
+
+Exit code: the wp-cli container's exit code.
+EOF
+}
+
+# Surface --help / -h before treating it as a slug.
+if (( $# == 0 )); then
+    _usage; exit 1
+fi
+case "$1" in
+    -h|--help) _usage; exit 0 ;;
+esac
+
+SLUG="$1"; shift
+(( $# >= 1 )) || _die "wp-exec: at least one wp-cli argument is required (e.g. 'plugin list')"
+
+_require_cmd docker
+
+# Validate slug exists in registry.
+site_json="$(_get_site "$SLUG")"
+[[ -n "$site_json" ]] || _die "wp-exec: slug '$SLUG' not found in $STATE_FILE"
+
+cname="wp-${SLUG}"
+# Validate container is running.
+status="$(docker inspect --format '{{.State.Status}}' "$cname" 2>/dev/null || true)"
+if [[ "$status" != "running" ]]; then
+    _die "wp-exec: container $cname not running (status=${status:-missing}); run: wp-resume $SLUG"
+fi
+
+# exec replaces this shell so signals + exit code propagate cleanly to wp-cli.
+exec docker exec -u www-data "$cname" wp "$@"

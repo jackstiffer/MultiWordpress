@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+# =============================================================================
+# bin/wp-list — list registered MultiWordpress sites
+# =============================================================================
+#
+# Usage:
+#   wp-list                       # human table, sorted by 24h-peak mem desc
+#   wp-list --json                # structured JSON output
+#   wp-list --secrets <slug>      # print /opt/wp/secrets/<slug>.env to stdout
+#                                 # (requires root since file is mode 600)
+#
+# Plan:    .planning/phases/02-cli-core-first-site-e2e/02-PLAN-05-wp-list-stats-logs-exec.md
+# Context: .planning/phases/02-cli-core-first-site-e2e/02-CONTEXT.md (wp-list)
+# =============================================================================
+
+set -euo pipefail
+
+# Read-only verb: do not require root for default + --json modes.
+READ_ONLY=1
+# shellcheck source=_lib.sh
+source "$(dirname "$0")/_lib.sh"
+
+_usage() {
+    cat <<EOF
+Usage: wp-list [--json] [--secrets <slug>] [-h|--help]
+
+Lists registered MultiWordpress sites with status, port, redis-db, and
+current/24h-peak memory usage.
+
+Options:
+  --json                Emit structured JSON instead of an aligned table.
+  --secrets <slug>      Print /opt/wp/secrets/<slug>.env to stdout (requires
+                        root; the .env file is mode 600).
+  -h, --help            Show this help.
+
+Columns (default mode):
+  SLUG | DOMAIN | STATUS | TIER | PORT | REDIS-DB | MEM-NOW | MEM-PEAK-24H
+
+Status mapping (Docker state x registry state):
+  running   — Docker running + registry state finalized
+  paused    — registry state paused
+  stopped   — Docker exited
+  partial   — registry state non-finalized non-paused (e.g. db_created)
+EOF
+}
+
+# -----------------------------------------------------------------------------
+# Arg parsing
+# -----------------------------------------------------------------------------
+JSON_OUT=0
+SECRETS_SLUG=""
+while (( $# )); do
+    case "$1" in
+        --json)        JSON_OUT=1; shift ;;
+        --secrets)
+            [[ $# -ge 2 ]] || _die "wp-list: --secrets requires a slug"
+            SECRETS_SLUG="$2"
+            shift 2
+            ;;
+        -h|--help)     _usage; exit 0 ;;
+        *)             _die "wp-list: unknown argument: $1" ;;
+    esac
+done
+
+# -----------------------------------------------------------------------------
+# --secrets mode
+# -----------------------------------------------------------------------------
+if [[ -n "$SECRETS_SLUG" ]]; then
+    # Mode 600 file → must be root.
+    if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+        _die "wp-list --secrets requires root (secrets file is mode 600); re-run with sudo"
+    fi
+    # Validate slug exists in registry.
+    site_json="$(_get_site "$SECRETS_SLUG")"
+    [[ -n "$site_json" ]] || _die "wp-list --secrets: slug '$SECRETS_SLUG' not found in $STATE_FILE"
+    secrets_path="${SECRETS_DIR}/${SECRETS_SLUG}.env"
+    [[ -f "$secrets_path" ]] || _die "wp-list --secrets: $secrets_path missing"
+    printf -- '── Secrets for %s ── (not stored in shell history)\n' "$SECRETS_SLUG"
+    cat "$secrets_path"
+    exit 0
+fi
+
+# -----------------------------------------------------------------------------
+# Collect runtime data once (perf: single docker stats invocation, cached).
+# -----------------------------------------------------------------------------
+_require_cmd jq
+_require_cmd docker
+
+state_json="$(_load_state)"
+
+# Pull all running containers' MemUsage in one shot.
+# Format: "<name> <memusage>" e.g. "wp-myblog 134.5MiB / 0B"
+docker_stats_raw=""
+if docker_stats_raw="$(docker stats --no-stream --format '{{.Name}} {{.MemUsage}}' 2>/dev/null)"; then
+    :
+else
+    docker_stats_raw=""
+fi
+
+# Look up MemUsage MB for a container name (e.g. wp-myblog). Echo "-" if absent.
+_lookup_mem_now_mb() {
+    local cname="$1" line raw num unit
+    line="$(printf '%s\n' "$docker_stats_raw" | awk -v n="$cname" '$1==n {sub($1 FS, ""); print; exit}')"
+    [[ -n "$line" ]] || { printf '%s' "-"; return 0; }
+    raw="${line%% *}"   # "134.5MiB"
+    # Extract numeric and unit
+    if [[ "$raw" =~ ^([0-9]+(\.[0-9]+)?)([A-Za-z]+)$ ]]; then
+        num="${BASH_REMATCH[1]}"
+        unit="${BASH_REMATCH[3]}"
+    else
+        printf '%s' "-"; return 0
+    fi
+    # Convert to MB (rounded).
+    awk -v n="$num" -v u="$unit" 'BEGIN {
+        u=tolower(u);
+        if (u=="b")        mb = n / 1048576;
+        else if (u=="kib" || u=="kb") mb = n / 1024;
+        else if (u=="mib" || u=="mb") mb = n;
+        else if (u=="gib" || u=="gb") mb = n * 1024;
+        else if (u=="tib" || u=="tb") mb = n * 1048576;
+        else                             mb = n;
+        printf("%d", mb + 0.5);
+    }'
+}
+
+# Lookup Docker container State.Status for a container (running/exited/paused/etc).
+_lookup_docker_status() {
+    local cname="$1" out
+    if out="$(docker inspect --format '{{.State.Status}}' "$cname" 2>/dev/null)"; then
+        printf '%s' "$out"
+    else
+        printf '%s' "missing"
+    fi
+}
+
+# Compute mem_peak_24h_mb for a slug from metrics.json. "-" if absent.
+_lookup_peak_mem_mb() {
+    local slug="$1" bytes
+    [[ -f "$METRICS_FILE" ]] || { printf '%s' "-"; return 0; }
+    bytes="$(jq -r --arg s "$slug" '.sites[$s].mem_peak_bytes // empty' "$METRICS_FILE" 2>/dev/null)"
+    if [[ -z "$bytes" || "$bytes" == "null" ]]; then
+        printf '%s' "-"; return 0
+    fi
+    awk -v b="$bytes" 'BEGIN { printf("%d", (b/1048576) + 0.5) }'
+}
+
+# Derive overall site status from Docker state + registry state.
+#   running  — docker running + registry finalized
+#   paused   — registry paused
+#   stopped  — docker exited
+#   partial  — registry non-finalized non-paused (e.g. db_created, container_booted, ...)
+_derive_status() {
+    local dstate="$1" rstate="$2"
+    if [[ "$rstate" == "paused" ]]; then
+        printf '%s' "paused"
+    elif [[ "$dstate" == "running" && "$rstate" == "finalized" ]]; then
+        printf '%s' "running"
+    elif [[ "$dstate" == "exited" || "$dstate" == "missing" ]]; then
+        printf '%s' "stopped"
+    else
+        printf '%s' "partial"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Build a row array per site: slug|domain|status|tier|port|redis_db|mem_now|mem_peak
+# Sortable by mem_peak desc; rows with "-" peak go last.
+# -----------------------------------------------------------------------------
+declare -a rows_with_peak rows_no_peak
+all_slugs="$(printf '%s' "$state_json" | jq -r '.sites | keys[]?' 2>/dev/null || true)"
+
+while IFS= read -r slug; do
+    [[ -n "$slug" ]] || continue
+    domain="$(printf '%s' "$state_json"     | jq -r --arg s "$slug" '.sites[$s].domain   // "-"')"
+    port="$(printf '%s'  "$state_json"      | jq -r --arg s "$slug" '.sites[$s].port     // "-"')"
+    redis_db="$(printf '%s' "$state_json"   | jq -r --arg s "$slug" '.sites[$s].redis_db // "-"')"
+    rstate="$(printf '%s' "$state_json"     | jq -r --arg s "$slug" '.sites[$s].state    // "unknown"')"
+
+    cname="wp-${slug}"
+    dstate="$(_lookup_docker_status "$cname")"
+    status="$(_derive_status "$dstate" "$rstate")"
+
+    if [[ "$status" == "running" ]]; then
+        mem_now="$(_lookup_mem_now_mb "$cname")"
+    else
+        mem_now="-"
+    fi
+    mem_peak="$(_lookup_peak_mem_mb "$slug")"
+
+    # tier reserved for future; single shared pool today.
+    row="${slug}|${domain}|${status}|shared|${port}|${redis_db}|${mem_now}|${mem_peak}"
+    if [[ "$mem_peak" == "-" ]]; then
+        rows_no_peak+=("$row")
+    else
+        rows_with_peak+=("$row")
+    fi
+done <<< "$all_slugs"
+
+# Sort rows_with_peak by mem_peak (field 8) descending.
+sorted_with_peak=()
+if (( ${#rows_with_peak[@]} > 0 )); then
+    while IFS= read -r line; do
+        sorted_with_peak+=("$line")
+    done < <(printf '%s\n' "${rows_with_peak[@]}" | sort -t'|' -k8,8nr)
+fi
+
+all_rows=("${sorted_with_peak[@]}" "${rows_no_peak[@]}")
+
+# -----------------------------------------------------------------------------
+# JSON output
+# -----------------------------------------------------------------------------
+if (( JSON_OUT == 1 )); then
+    out='{"sites":[]}'
+    for row in "${all_rows[@]}"; do
+        IFS='|' read -r slug domain status tier port redis_db mem_now mem_peak <<< "$row"
+        # numeric coercion for mem fields ("-" → null, integer → number)
+        mem_now_arg="$mem_now"
+        mem_peak_arg="$mem_peak"
+        out="$(printf '%s' "$out" | jq \
+            --arg slug "$slug" --arg domain "$domain" --arg status "$status" \
+            --arg port "$port" --arg redis_db "$redis_db" \
+            --arg mem_now "$mem_now_arg" --arg mem_peak "$mem_peak_arg" \
+            '.sites += [{
+                slug: $slug,
+                domain: $domain,
+                status: $status,
+                port: ($port | tonumber? // null),
+                redis_db: ($redis_db | tonumber? // null),
+                mem_now_mb: ($mem_now | tonumber? // null),
+                mem_peak_24h_mb: ($mem_peak | tonumber? // null)
+            }]')"
+    done
+    printf '%s\n' "$out" | jq .
+    exit 0
+fi
+
+# -----------------------------------------------------------------------------
+# Human table
+# -----------------------------------------------------------------------------
+if (( ${#all_rows[@]} == 0 )); then
+    printf 'No sites registered. Use wp-create <domain> to provision one.\n'
+    exit 0
+fi
+
+printf '%-20s %-30s %-9s %-7s %-6s %-9s %-10s %s\n' \
+    "SLUG" "DOMAIN" "STATUS" "TIER" "PORT" "REDIS-DB" "MEM-NOW" "MEM-PEAK-24H"
+
+running=0; paused=0
+for row in "${all_rows[@]}"; do
+    IFS='|' read -r slug domain status tier port redis_db mem_now mem_peak <<< "$row"
+    [[ "$status" == "running" ]] && running=$((running+1))
+    [[ "$status" == "paused"  ]] && paused=$((paused+1))
+    mem_now_disp="$mem_now"
+    [[ "$mem_now"  != "-" ]] && mem_now_disp="${mem_now} MB"
+    mem_peak_disp="$mem_peak"
+    [[ "$mem_peak" != "-" ]] && mem_peak_disp="${mem_peak} MB"
+    printf '%-20s %-30s %-9s %-7s %-6s %-9s %-10s %s\n' \
+        "$slug" "$domain" "$status" "$tier" "$port" "$redis_db" "$mem_now_disp" "$mem_peak_disp"
+done
+
+printf '\nTotal: %d sites — running=%d paused=%d\n' "${#all_rows[@]}" "$running" "$paused"

@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# =============================================================================
+# bin/wp-logs — tail docker compose logs for a registered site
+# =============================================================================
+#
+# Usage:
+#   wp-logs <slug>                 # last 100 lines
+#   wp-logs <slug> --tail 500
+#   wp-logs <slug> --follow        # stream until Ctrl-C
+#   wp-logs <slug> -f --tail 200
+#
+# Plan:    .planning/phases/02-cli-core-first-site-e2e/02-PLAN-05-wp-list-stats-logs-exec.md
+# Context: .planning/phases/02-cli-core-first-site-e2e/02-CONTEXT.md (wp-logs)
+# =============================================================================
+
+set -euo pipefail
+
+READ_ONLY=1
+# shellcheck source=_lib.sh
+source "$(dirname "$0")/_lib.sh"
+
+_usage() {
+    cat <<EOF
+Usage: wp-logs <slug> [--follow|-f] [--tail <N>] [-h|--help]
+
+Streams docker compose logs for a registered site by sourcing
+/opt/wp/sites/<slug>/compose.yaml.
+
+Options:
+  --follow, -f       Stream new log lines (Ctrl-C to exit).
+  --tail N           Show the last N lines (default: 100 when not following).
+  -h, --help         Show this help.
+
+Examples:
+  wp-logs myblog
+  wp-logs myblog --tail 500
+  wp-logs myblog -f
+EOF
+}
+
+SLUG=""
+FOLLOW=0
+TAIL=""
+while (( $# )); do
+    case "$1" in
+        -h|--help)   _usage; exit 0 ;;
+        -f|--follow) FOLLOW=1; shift ;;
+        --tail)
+            [[ $# -ge 2 ]] || _die "wp-logs: --tail requires a number"
+            [[ "$2" =~ ^[0-9]+$ ]] || _die "wp-logs: --tail must be a non-negative integer (got: $2)"
+            TAIL="$2"
+            shift 2
+            ;;
+        --) shift; break ;;
+        -*) _die "wp-logs: unknown flag: $1" ;;
+        *)
+            if [[ -z "$SLUG" ]]; then
+                SLUG="$1"; shift
+            else
+                _die "wp-logs: unexpected positional argument: $1"
+            fi
+            ;;
+    esac
+done
+
+[[ -n "$SLUG" ]] || { _usage; exit 1; }
+_require_cmd docker
+
+# Validate slug exists in registry.
+site_json="$(_get_site "$SLUG")"
+[[ -n "$site_json" ]] || _die "wp-logs: slug '$SLUG' not found in $STATE_FILE"
+
+# Validate compose file exists.
+compose_file="${SITES_DIR}/${SLUG}/compose.yaml"
+[[ -f "$compose_file" ]] || _die "wp-logs: $compose_file missing — site files may have been removed"
+
+# Default tail if neither flag passed.
+if [[ -z "$TAIL" && "$FOLLOW" == "0" ]]; then
+    TAIL="100"
+fi
+
+args=()
+[[ -n "$TAIL" ]]            && args+=(--tail "$TAIL")
+[[ "$FOLLOW" == "1" ]]      && args+=(--follow)
+
+exec docker compose -f "$compose_file" logs "${args[@]}"
