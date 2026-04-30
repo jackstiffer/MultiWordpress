@@ -6,16 +6,16 @@
 // .env file (loaded by Docker into the container's environment).
 
 // --- XML-RPC disabled (HARD-02) ------------------------------------
-// The authoritative block happens at the edge: Caddy returns 403 for
-// /xmlrpc.php (see templates/caddy-block.tmpl). The filters below are
-// belt-and-suspenders for any code path that bypasses Caddy (e.g.
-// internal cron, debug shells). XMLRPC_REQUEST signals intent to
-// plugins that honor it.
-add_filter('xmlrpc_enabled', '__return_false');
-add_filter('wp_headers', function ($headers) {
-    unset($headers['X-Pingback']);
-    return $headers;
-});
+// The authoritative block is at the edge: Caddy returns 403 for
+// /xmlrpc.php (see templates/caddy-block.tmpl). This file is included
+// from wp-config.php BEFORE WordPress core loads, so we MUST NOT call
+// add_filter() / add_action() here — those functions don't exist yet
+// and would cause a fatal error.
+//
+// XMLRPC_REQUEST = false signals "treat any request as not-XML-RPC" to
+// plugins that check this constant. The Caddy 403 is what actually
+// blocks the surface; this is a belt-and-suspenders signal for any
+// code path that runs without going through Caddy (cron, WP-CLI).
 if (!defined('XMLRPC_REQUEST')) {
     define('XMLRPC_REQUEST', false);
 }
