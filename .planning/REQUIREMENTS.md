@@ -31,7 +31,6 @@
 - [ ] **CLI-04**: `wp-create` allocates ports from a 18000+ pool, allocates a redis DB index per site, generates secrets — all serialized with a lockfile to prevent races.
 - [ ] **CLI-05**: `wp-create` rolls back cleanly on any step failure (DB drop, dirs remove, container remove) via `trap ERR`.
 - [ ] **CLI-06**: `wp-delete <site>` stops + removes container, drops DB + DB user, removes secrets file, removes site dirs, and prints Caddy/Cloudflare cleanup instructions.
-- [ ] **CLI-07**: `wp-delete --archive` writes `wp-content` tarball + DB dump to `/opt/wp/backups/archive/<slug>-<timestamp>.tar.gz` before deletion.
 - [ ] **CLI-08**: `wp-list` shows all sites: slug, domain, status (running/stopped), port, redis DB, container ID. Supports `wp-list --secrets <slug>` to re-display creds without exposing in shell history.
 
 ### CLI — Operations
@@ -39,8 +38,7 @@
 - [ ] **CLI-09**: `wp-stats` shows system-wide CPU/mem/disk usage and per-container stats for all `wp-*` containers (parses `docker stats --no-stream` JSON).
 - [ ] **CLI-10**: `wp-logs <site>` tails docker logs for one site; `wp-logs <site> --follow` streams.
 - [ ] **CLI-11**: `wp-exec <site> <wp-cli-command>` passes through to WP-CLI inside the target container (e.g., `wp-exec blog plugin install yoast`).
-- [ ] **CLI-12**: `wp-backup <site>` writes DB dump (`mysqldump --single-transaction --quick`) + wp-content tarball to `/opt/wp/backups/<slug>/<timestamp>/`. Uses single-DB dump — never global locks.
-- [ ] **CLI-13**: `wp-restore <site> <backup-path>` restores DB + wp-content from a backup directory.
+- [ ] **CLI-14**: `wp-pause <site>` and `wp-resume <site>` toggle a site's running state. `wp-pause` stops the container (frees its RAM, keeps DB + files + secrets intact), marks state `paused` in the registry, and prints the optional Caddy snippet to swap in a "site paused" stub if the operator wants visitors to see a friendly page instead of 502. `wp-resume` starts the container, restores state to `running`. `wp-list` shows paused sites distinctly.
 
 ### State & Secrets
 
@@ -69,7 +67,7 @@
 
 ### Documentation
 
-- [ ] **DOC-01**: README explains: installation, prerequisites (Caddy + Cloudflare assumptions), full lifecycle of one site, backup/restore workflow.
+- [ ] **DOC-01**: README explains: installation, prerequisites (Caddy + Cloudflare assumptions), full lifecycle of one site (create → live → delete).
 - [ ] **DOC-02**: Caddy snippet template included; one-page guide for paste-into-Caddy + Cloudflare DNS rows.
 - [ ] **DOC-03**: Scaling-cliff doc: warning signs that single-VM design has been outgrown.
 
@@ -84,11 +82,9 @@ Deferred. Tracked, not in current roadmap.
 - **OPS2-03**: `wp-disk` — per-site disk usage breakdown (uploads, DB).
 - **OPS2-04**: `wp-stats --top` — rank by request rate (parses access logs).
 - **OPS2-05**: Maintenance-mode shortcut.
-- **OPS2-06**: Weekly backup-restore smoke-test cron.
 
 ### Future
 
-- **FUT-01**: S3 offsite backup target.
 - **FUT-02**: `wp-rename <old-domain> <new-domain>`.
 - **FUT-03**: Slack/Discord alert hook on failures.
 - **FUT-04**: Per-site PHP version pinning.
@@ -105,6 +101,7 @@ Deferred. Tracked, not in current roadmap.
 | Per-site staging / blue-green deploys | Out of scope; manual `wp-backup` + clone is sufficient |
 | Site clone / duplicate utility | Defer; not a blog-network use case |
 | Web-based shell or file browser | Security risk; use SSH |
+| Backup / restore tooling (`wp-backup`, `wp-restore`, `--archive`, S3 offload) | Out of scope — operator handles backups out-of-band (e.g., `wp-exec <site> wp db export`, host-level snapshots, or Cloudflare/managed backups) |
 | Plugin/theme marketplace UI | WP admin already does this |
 | One-click installers for non-WP apps | This tool is WordPress-only |
 | Built-in CDN | Cloudflare is in front; no second CDN |
@@ -138,13 +135,11 @@ Deferred. Tracked, not in current roadmap.
 | CLI-04 | Phase 2 | Pending |
 | CLI-05 | Phase 2 | Pending |
 | CLI-06 | Phase 2 | Pending |
-| CLI-07 | Phase 2 | Pending |
 | CLI-08 | Phase 2 | Pending |
 | CLI-09 | Phase 2 | Pending |
 | CLI-10 | Phase 2 | Pending |
 | CLI-11 | Phase 2 | Pending |
-| CLI-12 | Phase 2 | Pending |
-| CLI-13 | Phase 2 | Pending |
+| CLI-14 | Phase 2 | Pending |
 | STATE-01 | Phase 2 | Pending |
 | STATE-02 | Phase 2 | Pending |
 | STATE-03 | Phase 2 | Pending |
@@ -163,8 +158,8 @@ Deferred. Tracked, not in current roadmap.
 | DOC-03 | Phase 4 | Pending |
 
 **Coverage:**
-- v1 requirements: 36 total
-- Mapped to phases: 36 ✓
+- v1 requirements: 34 total
+- Mapped to phases: 34 ✓
 - Unmapped: 0
 
 ### By Phase

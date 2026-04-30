@@ -23,12 +23,12 @@ A lightweight, multi-site WordPress hosting setup that runs alongside existing N
 - [ ] CLI tool: `wp-delete <site>` — removes container, drops DB, archives wp-content (or deletes per flag)
 - [ ] CLI tool: `wp-list` — show all sites with status
 - [ ] CLI tool: `wp-stats` — system-wide + per-container CPU/mem/disk
+- [ ] CLI tools: `wp-pause` / `wp-resume` — stop a site's container to free its RAM (DB + files preserved), restart on resume; status surfaced in `wp-list`
 - [ ] All container logs capped at 10 MB / 3 files (matches AudioStoryV2 pattern)
 - [ ] WordPress-internal logs (debug.log, php-fpm error log) also rotated to ~10 MB / 3 files
 - [ ] Stack stays under ~50% of host (≤ 1 vCPU, ≤ 4 GB RAM with 5+ sites at typical load)
 - [ ] FastCGI/page caching strategy that makes logged-out reads near-static-file fast
 - [ ] Thin PHP dashboard (read-only stats + add/delete buttons that shell out to the CLI)
-- [ ] Backup/restore CLI for wp-content + DB dump per site
 - [ ] Docs: how to wire a new site into the existing host Caddy + Cloudflare
 
 ### Out of Scope
@@ -42,6 +42,7 @@ A lightweight, multi-site WordPress hosting setup that runs alongside existing N
 - Staging environments / blue-green deploys per site
 - Per-site CPU/RAM attribution beyond what `docker stats` already gives — system-wide is fine
 - Migration tooling from existing hosts — sites will be created fresh or imported manually via WP-CLI
+- Backup / restore tooling (`wp-backup`, `wp-restore`, `--archive`, S3 offload) — operator handles backups out-of-band (host-level snapshots, manual `wp-exec <site> wp db export`, or external service)
 
 ## Context
 
