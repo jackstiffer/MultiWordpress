@@ -5,8 +5,9 @@ Lightweight, multi-site WordPress hosting for a single GCP VM that already runs 
 ## Status
 
 - **Phase 1 (Foundation): COMPLETE** — shared infra compose, per-site image template, and host `wp.slice` are all shipped and verifiable.
-- **Phase 2 (CLI Core + First Site E2E): NEXT** — `wp-create` / `wp-delete` / `wp-list` / `wp-stats` / `wp-pause` / `wp-resume` and the first real domain end-to-end.
-- Phases 3 (cron stagger + metrics) and 4 (dashboard + docs) follow.
+- **Phase 2 (CLI Core + First Site E2E): COMPLETE** — all eight CLI verbs (`wp-create` / `wp-delete` / `wp-pause` / `wp-resume` / `wp-list` / `wp-stats` / `wp-logs` / `wp-exec`) shipped and locally smoke-tested. First-real-domain E2E runbook lives in [`docs/cli.md`](docs/cli.md) (operator-driven).
+- **Phase 3 (Operational Tooling): NEXT** — staggered host cron, `wp-metrics-poll` writing 24h rolling peaks to `metrics.json`, 5-site real-load validation.
+- Phase 4 (dashboard + docs) follows.
 
 ## Architecture
 
@@ -119,6 +120,26 @@ If all six rows pass, Phase 1 is done.
 └── .planning/                # GSD-managed planning artifacts (tracked in git)
 ```
 
+## CLI Quick Reference
+
+After Phase 1 setup completes:
+
+- `wp-create <domain>` — provision a new site
+- `wp-delete <slug>` — full teardown
+- `wp-pause <slug>` / `wp-resume <slug>` — stop/start (free RAM, preserve data)
+- `wp-list` — show all sites
+- `wp-stats` — pool usage + per-site metrics
+- `wp-logs <slug> [-f]` — tail container logs
+- `wp-exec <slug> <wp-cli-args>` — passthrough to WP-CLI
+
+Full reference: [docs/cli.md](docs/cli.md). E2E first-site runbook: [docs/first-site-e2e.md](docs/first-site-e2e.md) (pending Phase 2 plan 07).
+
+Wiring smoke test (after install, no Docker engine touched):
+
+```bash
+./bin/_smoke-test.sh
+```
+
 ## What's in `.planning/`
 
 `.planning/` is the [Get Shit Done (GSD)](https://github.com/) project planning directory: PROJECT goals, locked REQUIREMENTS, the phased ROADMAP, per-phase contexts and PLAN files, and per-plan SUMMARY files capturing what shipped and any deviations. Humans don't need to edit it day-to-day, but reading it is the fastest way to understand *why* the stack is shaped the way it is — every implementation decision (MTU 1460, loopback-only ports, no per-site mem cap, log caps, etc.) is traced back to a requirement and a pitfall. Tracked in git on purpose.
@@ -147,7 +168,7 @@ The per-site image runs as `www-data` = **UID/GID 82** (the Alpine convention us
 ## Roadmap
 
 - **Phase 1: Foundation** *(complete)* — shared MariaDB + Redis, per-site image template, host `wp.slice` (4 GiB cap), every day-one pitfall (MTU, loopback ports, log caps, image hardening) closed.
-- **Phase 2: CLI Core + First Site E2E** — `wp-create` / `wp-delete` / `wp-list` / `wp-stats` / `wp-logs` / `wp-exec` / `wp-pause` / `wp-resume`; first real domain live; Cloudflare + Super Page Cache strategy proves out (`cf-cache-status: HIT`, sub-100 ms TTFB for logged-out reads).
+- **Phase 2: CLI Core + First Site E2E** *(complete — code shipped; first-real-domain validation pending operator)* — `wp-create` / `wp-delete` / `wp-list` / `wp-stats` / `wp-logs` / `wp-exec` / `wp-pause` / `wp-resume`; full CLI reference at [`docs/cli.md`](docs/cli.md); Cloudflare + Super Page Cache strategy proves out (`cf-cache-status: HIT`, sub-100 ms TTFB for logged-out reads) once operator runs the first real domain through the runbook.
 - **Phase 3: Operational Tooling** — staggered host cron (`DISABLE_WP_CRON=true` per site + offset by slug-hash modulo); `wp-metrics-poll` writing 24h rolling peaks to `/opt/wp/state/metrics.json`; budget validated under 5-site real load.
 - **Phase 4: Polish — Dashboard + Docs** — thin read-mostly PHP dashboard (cluster + per-site stats, sudoers-whitelisted add/delete buttons); operator runbook (Caddy snippet template, Cloudflare DNS guide, scaling-cliff doc).
 

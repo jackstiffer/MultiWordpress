@@ -1,0 +1,725 @@
+# MultiWordpress CLI Reference
+
+Phase 2 ships eight CLI verbs that operate on the Phase 1 foundation
+(`compose/compose.yaml` shared infra + `multiwp:wordpress-6-php8.3` per-site
+image + `wp.slice` host cgroup). Every verb is a stand-alone bash script in
+`bin/`; all share `bin/_lib.sh` for state I/O, logging, locking, secrets, and
+DB / Docker helpers.
+
+## On-Host Layout
+
+```
+/opt/wp/                              # WP_ROOT (overridable via env)
+├── state/
+│   ├── sites.json                    # registry, mode 644
+│   ├── allocator.lock                # flock target (port + redis-db)
+│   └── metrics.json                  # written by Phase 3 metrics-poll
+├── secrets/
+│   └── <slug>.env                    # per-site, mode 600 root-owned
+└── sites/
+    └── <slug>/
+        ├── wp-content/               # bind-mounted into container (chown 82:82)
+        └── compose.yaml              # generated per-site compose
+```
+
+## Prerequisites
+
+- Phase 1 deployed: `wp-mariadb` healthy, `wp-redis` running, `wp-network`
+  external bridge present, `wp.slice` cgroup active
+  (`/sys/fs/cgroup/wp.slice` exists, `memory.max == 4294967296`).
+- Image `multiwp:wordpress-6-php8.3` built locally.
+- Host commands available: `docker`, `jq`, `openssl`, `flock`, `sed`, `awk`.
+- The CLI is invoked from the repo's `bin/` directory. Either add it to
+  `PATH` or call scripts by absolute path:
+
+  ```bash
+  export PATH="/opt/wp-repo/bin:$PATH"   # one-time per shell
+  # ── or ──
+  sudo /opt/wp-repo/bin/wp-create blog.example.com
+  ```
+
+## Authentication / Privilege
+
+State-mutating verbs (`wp-create`, `wp-delete`, `wp-pause`, `wp-resume`,
+`wp-list --secrets`) require **root**. Read-only invocations (`wp-list`,
+`wp-stats`, `wp-logs`, `wp-exec`) do not. Scripts call `_require_root` early
+and exit with a clear error if invoked unprivileged.
+
+## Shared Concepts
+
+- **Slug derivation.** `<domain>` → lowercase, `.` and `-` → `_`, strip
+  non-`[a-z0-9_]`, cap 32 chars, refuse reserved (`mariadb`, `redis`,
+  `network`). E.g. `Blog.Example.com` → `blog_example_com`.
+- **State machine.** Per-site: `db_created` → `dirs_created` →
+  `container_booted` → `wp_installed` → `finalized`. Failure marks the
+  entry `failed`; rollback runs in reverse order. `wp-pause` switches
+  state to `paused`; `wp-resume` puts it back to `finalized`.
+- **Allocators.** Ports `18000-18999`, redis DBs `1-63`. Both serialized
+  via `flock` on `/opt/wp/state/allocator.lock`.
+- **Secrets file.** `/opt/wp/secrets/<slug>.env`, mode `600`, root-owned.
+  Contains DB credentials, WP admin user/password/email, and 8 WP salts.
+  Re-display via `wp-list --secrets <slug>`.
+- **Output convention.** Logs go to **stderr**; user data (creds, JSON,
+  snippets) goes to **stdout**. `--json` emits machine-readable output
+  (used by Phase 4 dashboard); default is human-readable with optional
+  ANSI color (auto-disabled in pipes / when `NO_COLOR` is set).
+
+## Table of Contents
+
+- [wp-create](#wp-create) — provision a new site end-to-end
+- [wp-delete](#wp-delete) — destructive teardown
+- [wp-pause](#wp-pause) — stop container, keep DB + files
+- [wp-resume](#wp-resume) — restart a paused container
+- [wp-list](#wp-list) — registry + status table
+- [wp-stats](#wp-stats) — cluster + per-site metrics
+- [wp-logs](#wp-logs) — tail per-site logs
+- [wp-exec](#wp-exec) — WP-CLI passthrough
+- [Lifecycle examples](#lifecycle-examples)
+- [State machine reference](#state-machine-reference)
+- [First-domain validation](#first-domain-validation)
+- [Troubleshooting](#troubleshooting)
+
+---
+
+## wp-create
+
+**Synopsis:** provision a WordPress site end-to-end (DB → dirs → container →
+`wp core install` → redis-cache plugin → `wp-config-extras.php` → finalize),
+then print Caddy + Cloudflare snippets for the operator to paste.
+
+**Usage:**
+
+```
+wp-create <domain> [--admin-email <email>] [--resume <slug>]
+                   [--dry-run] [--json] [-h|--help]
+```
+
+**Flags:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `<domain>` | — | Required positional (or use `--resume <slug>`). FQDN, e.g. `blog.example.com`. |
+| `--admin-email EMAIL` | `admin@<domain>` | WP admin email. |
+| `--resume SLUG` | — | Continue a partial provisioning from the last completed state. Entry must already exist in `sites.json`. |
+| `--dry-run` | off | Validate slug + show planned port / redis-db. No DB writes, no docker calls. |
+| `--json` | off | Emit final summary as JSON instead of human-readable. |
+| `-h`, `--help` | — | Show usage. |
+
+**Examples:**
+
+```bash
+sudo wp-create blog.example.com
+sudo wp-create blog.example.com --admin-email me@example.com
+sudo wp-create --resume blog_example_com
+wp-create --dry-run blog.example.com
+```
+
+**Sample human output (success):**
+
+```
+[2026-04-30T15:00:14Z] [INFO] state → finalized
+✓ Site created: https://blog.example.com
+
+Admin URL:      https://blog.example.com/wp-admin/
+Admin user:     admin_4a7c1d92
+Admin password: (32-char random)
+Admin email:    me@example.com
+
+Saved to: /opt/wp/secrets/blog_example_com.env (mode 600 — re-read with `wp-list --secrets blog_example_com`)
+
+── Cloudflare DNS rows ──
+Type   Name      Content          Proxy
+A      blog      203.0.113.42     Proxied
+
+── Caddy block ──
+blog.example.com {
+    php_fastcgi 127.0.0.1:18000
+    root * /opt/wp/sites/blog_example_com/wp-content
+    encode gzip
+}
+
+── Cloudflare Cache Rule ──
+See templates/cloudflare-cache-rule.md (one-time per zone).
+
+── Next ──
+1. Add the DNS row above in Cloudflare dashboard.
+2. Paste the Caddy block into your Caddyfile and `caddy reload`.
+3. Apply the Cloudflare Cache Rule (one-time, see referenced doc).
+4. Validate: curl -sI https://blog.example.com/ | grep -i cf-cache-status → expect HIT after 2nd request.
+```
+
+**Sample `--json` output:**
+
+```json
+{
+  "status": "created",
+  "domain": "blog.example.com",
+  "slug": "blog_example_com",
+  "port": 18000,
+  "redis_db": 2,
+  "admin_user": "admin_4a7c1d92",
+  "admin_password": "...",
+  "admin_email": "me@example.com",
+  "secrets_file": "/opt/wp/secrets/blog_example_com.env",
+  "caddy_block": "blog.example.com {\n  ...\n}",
+  "cloudflare_dns": "..."
+}
+```
+
+**Side effects:**
+
+- Mutates `/opt/wp/state/sites.json`.
+- Writes `/opt/wp/secrets/<slug>.env` (mode 600, root-owned).
+- Creates `/opt/wp/sites/<slug>/wp-content/` (chown 82:82).
+- Renders `/opt/wp/sites/<slug>/compose.yaml`.
+- Creates DB `wp_<slug>`, user `wp_<slug>'@'%'` with `MAX_USER_CONNECTIONS=40`.
+- Starts container `wp-<slug>` on `wp-network`, FastCGI on `127.0.0.1:<port>`.
+- Installs + activates `redis-cache` plugin; runs `wp redis enable`.
+
+**Notes / gotchas:**
+
+- Requires **root** (writes secrets at mode 600).
+- Refuses to provision if shared infra (`wp-mariadb` / `wp-redis`) is not
+  healthy — provisioning aborts in pre-flight.
+- Refuses if site already exists in any state other than `failed`. Use
+  `wp-delete` first or pass `--resume <slug>`.
+- `ERR` trap fires `_rollback`, which reverses the state machine in the
+  opposite order: compose down → `rm -rf` site dir → drop DB + user.
+  The sites.json entry is preserved but marked `failed` so `--resume`
+  can pick up.
+- DNS / TLS are NOT validated by `wp-create` — it prints snippets, the
+  operator pastes. See [first-domain validation](#first-domain-validation).
+
+**Exit codes:**
+
+| Code | Meaning |
+|---|---|
+| 0 | Site created (or `--dry-run` succeeded). |
+| 1 | Generic provisioning failure (after rollback). |
+| 2 | Bad arguments / missing positional. |
+
+---
+
+## wp-delete
+
+**Synopsis:** destructive teardown — remove container, DB, DB user, site
+directory, secrets file, and registry entry. Prints Caddy + Cloudflare
+cleanup snippets.
+
+**Usage:**
+
+```
+wp-delete <slug> [--yes] [--json] [-h|--help]
+```
+
+**Flags:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `<slug>` | — | Required. Site slug as listed by `wp-list`. |
+| `--yes` | off | Skip interactive confirmation. **Required** for non-tty contexts. |
+| `--json` | off | Emit cleanup snippets as JSON. |
+| `-h`, `--help` | — | Show usage. |
+
+**Examples:**
+
+```bash
+sudo wp-delete blog_example_com --yes
+sudo wp-delete blog_example_com           # interactive: prompts "type yes"
+sudo wp-delete blog_example_com --yes --json
+```
+
+**Sample human output:**
+
+```
+✓ Site blog_example_com (blog.example.com) deleted.
+
+── Manual cleanup ──
+1. Remove the Caddy block for blog.example.com from your Caddyfile, then: sudo caddy reload
+2. Remove the Cloudflare DNS row for blog.example.com.
+
+The Caddy block that was active:
+blog.example.com {
+  ...
+}
+
+Cloudflare DNS row to remove:
+  Type   Name                Content              Proxy
+  A      <subdomain or @>    <your VM public IP>  Proxied
+```
+
+**Sample `--json` output:**
+
+```json
+{
+  "slug": "blog_example_com",
+  "domain": "blog.example.com",
+  "port": "18000",
+  "status": "deleted",
+  "caddy_block": "blog.example.com {\n  ...\n}",
+  "dns_row": {"type":"A","name":"<subdomain_or_@>","content":"<vm_public_ip>","proxy":"Proxied"}
+}
+```
+
+**Side effects:** see synopsis. Idempotent on missing files (logs warnings,
+keeps going). Hard-fails only when **both** DB drop and filesystem cleanup
+fail — single-side failures degrade to warning.
+
+**Notes / gotchas:**
+
+- Requires **root**.
+- Non-interactive (no tty) without `--yes` aborts with a clear error.
+- Does NOT touch your Caddyfile or Cloudflare DNS — that is manual.
+
+**Exit codes:**
+
+| Code | Meaning |
+|---|---|
+| 0 | Deleted (possibly with warnings). |
+| 1 | Both DB drop and FS cleanup failed, OR site not found, OR missing `--yes` in non-tty. |
+| 2 | Unknown option. |
+
+---
+
+## wp-pause
+
+**Synopsis:** stop a site's container (`docker compose stop`). Frees its
+RAM. DB, files, and secrets are preserved. Idempotent: re-pausing an
+already-paused site is a no-op success.
+
+**Usage:**
+
+```
+wp-pause <slug> [--json] [-h|--help]
+```
+
+**Flags:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `<slug>` | — | Required. Site slug. |
+| `--json` | off | Emit result as JSON. |
+| `-h`, `--help` | — | Show usage. |
+
+**Examples:**
+
+```bash
+sudo wp-pause blog_example_com
+sudo wp-pause blog_example_com --json
+```
+
+**Sample human output:**
+
+```
+✓ Site blog_example_com (blog.example.com) paused. RAM freed; DB + files + secrets intact.
+  Resume with: wp-resume blog_example_com
+
+# Optional: swap your Caddy block for this stub while paused:
+# blog.example.com {
+#     respond "Site temporarily paused" 503
+# }
+```
+
+**Sample `--json` output:**
+
+```json
+{"slug":"blog_example_com","domain":"blog.example.com","status":"paused","message":"site stopped; RAM freed"}
+```
+
+**Side effects:** `docker compose stop` on `<sites>/<slug>/compose.yaml`;
+sets `state` to `paused` in `sites.json`; appends to `state_history`.
+
+**Notes:** root required. Pre-flight does NOT enforce shared-infra health
+(stop is always safe).
+
+**Exit codes:** `0` success / already paused. `1` bad slug / missing
+compose / docker error.
+
+---
+
+## wp-resume
+
+**Synopsis:** start a paused site (`docker compose up -d`). Verifies the
+container reaches `running` within 30s. Idempotent: already-running →
+no-op.
+
+**Usage:**
+
+```
+wp-resume <slug> [--json] [-h|--help]
+```
+
+**Flags:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `<slug>` | — | Required. Site slug. |
+| `--json` | off | Emit result as JSON. |
+| `-h`, `--help` | — | Show usage. |
+
+**Examples:**
+
+```bash
+sudo wp-resume blog_example_com
+sudo wp-resume blog_example_com --json
+```
+
+**Sample human output:**
+
+```
+✓ Site blog_example_com (blog.example.com) resumed. URL: https://blog.example.com
+```
+
+**Side effects:** `docker compose up -d`; sets `state` to `finalized`;
+appends to `state_history`.
+
+**Notes:**
+
+- Root required.
+- Pre-flight asserts `wp-mariadb` and `wp-redis` containers are running
+  before attempting `up -d`.
+
+**Exit codes:** `0` resumed / already running. `1` shared infra down /
+container failed to reach running.
+
+---
+
+## wp-list
+
+**Synopsis:** print the registry. One row per site: slug, domain, status,
+tier, port, redis-db, current memory, 24h-peak memory. Sorted by 24h-peak
+mem descending (sites with no peak data go last). `--secrets` mode dumps
+the per-site `.env` file.
+
+**Usage:**
+
+```
+wp-list [--json] [--secrets <slug>] [-h|--help]
+```
+
+**Flags:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--json` | off | Emit structured JSON instead of an aligned table. |
+| `--secrets SLUG` | — | Print `/opt/wp/secrets/<slug>.env` to stdout. Requires root. |
+| `-h`, `--help` | — | Show usage. |
+
+**Examples:**
+
+```bash
+wp-list
+wp-list --json | jq '.sites[] | select(.status == "running")'
+sudo wp-list --secrets blog_example_com
+```
+
+**Sample human output:**
+
+```
+SLUG                 DOMAIN                         STATUS    TIER    PORT   REDIS-DB  MEM-NOW    MEM-PEAK-24H
+blog_example_com     blog.example.com               running   shared  18000  2         134 MB     -
+shop_example_com     shop.example.com               paused    shared  18001  3         -          -
+
+Total: 2 sites — running=1 paused=1
+```
+
+**Sample `--json` output:**
+
+```json
+{
+  "sites": [
+    {
+      "slug": "blog_example_com",
+      "domain": "blog.example.com",
+      "status": "running",
+      "port": 18000,
+      "redis_db": 2,
+      "mem_now_mb": 134,
+      "mem_peak_24h_mb": null
+    }
+  ]
+}
+```
+
+**Status mapping** (Docker state × registry state):
+
+| Status | Meaning |
+|---|---|
+| `running` | Docker `running` + registry `finalized` |
+| `paused` | Registry `paused` |
+| `stopped` | Docker `exited` or container missing |
+| `partial` | Registry non-finalized non-paused (e.g. `db_created`) — provisioning interrupted |
+
+**Side effects:** none (read-only).
+
+**Notes:**
+
+- Mem peaks render `-` until Phase 3's `wp-metrics-poll` writes
+  `/opt/wp/state/metrics.json`.
+- `--secrets` requires root because `.env` is mode 600.
+
+**Exit codes:** `0` always (or `1` for missing slug / non-root in
+`--secrets` mode).
+
+---
+
+## wp-stats
+
+**Synopsis:** cluster header (`wp.slice` pool used / max / 24h peak,
+AudioStoryV2 health, `/opt/wp` disk usage) + per-site rows sorted by
+24h-peak memory descending.
+
+**Usage:**
+
+```
+wp-stats [--json] [-h|--help]
+```
+
+**Flags:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--json` | off | Structured JSON. |
+| `-h`, `--help` | — | Show usage. |
+
+**Examples:**
+
+```bash
+wp-stats
+wp-stats --json | jq '.cluster.pool_pct_now'
+```
+
+**Sample human output (Phase 2, no metrics.json yet):**
+
+```
+== Cluster ==
+wp.slice pool: 0.27 GB used / 4.00 GB total (7%) — 24h peak: -
+AudioStoryV2: audiostory-web — running (restarts=0)
+Disk /opt/wp: 1.2G used / 49G total (3%)
+
+(24h peaks unavailable — wp-metrics-poll not yet running; ships in Phase 3)
+
+SLUG                 DOMAIN                         MEM-NOW    DB-CONN-NOW
+blog_example_com     blog.example.com               134 MB     1
+
+Note: DB-CONN-NOW is a live snapshot, not a 24h peak.
+```
+
+**Color thresholds** (cluster pool peak vs `MemoryMax`):
+
+| Threshold | Color |
+|---|---|
+| `>= 100%` | red |
+| `>=  90%` | yellow |
+| else | default |
+
+Honors `NO_COLOR` and `isatty(stderr)` — colors auto-disable in pipes.
+
+**Sample `--json` output (truncated):**
+
+```json
+{
+  "cluster": {"pool_used_now_bytes": 287309824, "pool_max_bytes": 4294967296, "pool_pct_now": 7, "pool_pct_peak": null},
+  "audiostory": {"detected": true, "container": "audiostory-web", "status": "running", "restart_count": 0},
+  "disk": {"used": "1.2G", "total": "49G", "percent_used": "3%"},
+  "metrics_json_present": false,
+  "sites": [{"slug":"blog_example_com","domain":"blog.example.com","current_mem_bytes":140509184,"peak_mem_bytes_24h":null,"peak_cpu_pct_24h":null,"db_conn_now":1,"peak_db_conn_24h":null}]
+}
+```
+
+**Notes:**
+
+- Read-only; root not required (but cgroup files may be unreadable
+  unprivileged on some hosts).
+- DB-conn-now is a live `information_schema.processlist` snapshot, not a
+  24h peak.
+
+**Exit codes:** `0` always (best-effort: missing metrics.json, missing
+AudioStoryV2 container, etc. all degrade gracefully).
+
+---
+
+## wp-logs
+
+**Synopsis:** tail `docker compose logs` for a registered site.
+
+**Usage:**
+
+```
+wp-logs <slug> [--follow|-f] [--tail <N>] [-h|--help]
+```
+
+**Flags:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `<slug>` | — | Required. Site slug. |
+| `--follow`, `-f` | off | Stream new log lines (Ctrl-C to exit). |
+| `--tail N` | `100` (when not following) | Show last N lines. |
+| `-h`, `--help` | — | Show usage. |
+
+**Examples:**
+
+```bash
+wp-logs blog_example_com
+wp-logs blog_example_com --tail 500
+wp-logs blog_example_com -f
+```
+
+**Sample output:**
+
+```
+wp-blog_example_com  | 192.0.2.1 - 30/Apr/2026:15:01:22 +0000 "GET /index.php" 200
+wp-blog_example_com  | [30-Apr-2026 15:01:23] NOTICE: ready to handle connections
+```
+
+**Side effects:** none. Replaces the shell process via `exec` so signals
+propagate cleanly.
+
+**Notes:** `--tail 0` is allowed (lower-bound `0` per `_die` gate). The
+JSON log driver caps at `10m × 3` files (configured in the per-site
+compose template).
+
+**Exit codes:** `0` clean exit. `1` bad slug / bad `--tail` / missing
+compose file.
+
+---
+
+## wp-exec
+
+**Synopsis:** pure WP-CLI passthrough into `wp-<slug>` running as
+`www-data` (UID 82). All arguments after `<slug>` are forwarded verbatim.
+
+**Usage:**
+
+```
+wp-exec <slug> <wp-cli-args...>
+```
+
+**Flags:** none on the wrapper. Anything after `<slug>` is passed straight
+to `wp` inside the container.
+
+**Examples:**
+
+```bash
+wp-exec blog_example_com plugin list
+wp-exec blog_example_com user list --role=administrator
+wp-exec blog_example_com redis status
+wp-exec blog_example_com core update
+wp-exec blog_example_com plugin install super-page-cache-for-cloudflare --activate
+```
+
+**Sample output:**
+
+```
++--------------+----------+--------+---------+
+| name         | status   | update | version |
++--------------+----------+--------+---------+
+| redis-cache  | active   | none   | 2.5.4   |
++--------------+----------+--------+---------+
+```
+
+**Side effects:** whatever the WP-CLI command does. The container must be
+`running` (use `wp-resume` first if paused).
+
+**Notes:**
+
+- Uses `exec docker exec` so SIGINT / SIGTERM and the wp-cli exit code
+  propagate cleanly.
+- Refuses if container is not running.
+
+**Exit codes:** the wp-cli command's own exit code.
+
+---
+
+## Lifecycle examples
+
+```bash
+# Provision
+sudo wp-create blog.example.com
+
+# Pause to free RAM (DB + files preserved)
+sudo wp-pause blog_example_com
+
+# Resume
+sudo wp-resume blog_example_com
+
+# Destructive teardown
+sudo wp-delete blog_example_com --yes
+
+# Re-display creds for an existing site
+sudo wp-list --secrets blog_example_com
+
+# Run an arbitrary WP-CLI command
+sudo wp-exec blog_example_com plugin list
+
+# Inspect status
+wp-list
+wp-stats
+
+# Tail logs (200 lines, then follow)
+wp-logs blog_example_com --tail 200 -f
+```
+
+---
+
+## State machine reference
+
+Per-site states and the operation that transitions to each:
+
+| Rank | State | Reached by | Rollback action |
+|---|---|---|---|
+| 0 | _allocating_ (transient) | `_alloc_port` + `_alloc_redis_db` under `flock` | Drop registry entry |
+| 1 | `db_created` | `CREATE DATABASE` + `CREATE USER` + `GRANT` (verify scope) | `DROP USER`, `DROP DATABASE` |
+| 2 | `dirs_created` | `mkdir -p .../wp-content`, `chown 82:82` | `rm -rf /opt/wp/sites/<slug>` |
+| 3 | `container_booted` | `docker compose up -d`, port reachable | `docker compose down` |
+| 4 | `wp_installed` | `wp core install` | (no extra; DB drop covers it) |
+| 5 | `finalized` | `redis-cache` plugin active, wp-config-extras injected | — |
+| — | `paused` | `wp-pause` → `docker compose stop` | `wp-resume` |
+| — | `failed` | any `ERR` trap during provisioning | preserved for `--resume` diagnosis |
+
+`wp-create` rolls back in **reverse** rank order on any error and marks
+the entry `failed`. Use `wp-create --resume <slug>` to pick up; `_should_run_state`
+skips already-completed steps.
+
+---
+
+## First-domain validation
+
+The Phase 2 success criterion is one real domain serving from
+`cf-cache-status: HIT` for logged-out homepage. Concrete runbook lives
+at [first-site-e2e.md](first-site-e2e.md) (ships in plan 07).
+
+Quick reference:
+
+1. `sudo wp-create <real-domain>`.
+2. Paste the printed Cloudflare DNS row and Caddy block; `sudo caddy reload`.
+3. Apply the Cloudflare Cache Rule (one-time per zone) per
+   [`templates/cloudflare-cache-rule.md`](../templates/cloudflare-cache-rule.md):
+   bypass cache for cookies `wordpress_logged_in_*`, `wp-postpass_*`,
+   `comment_author_*`.
+4. Optionally install Super Page Cache for Cloudflare:
+   `sudo wp-exec <slug> plugin install super-page-cache-for-cloudflare --activate`.
+5. Validate:
+   ```bash
+   curl -sI https://<domain>/             | grep -i cf-cache-status   # expect HIT after 2nd hit
+   curl -sI -H 'Cookie: wordpress_logged_in_x=y' https://<domain>/wp-admin/ | grep -i cf-cache-status   # expect BYPASS / DYNAMIC
+   ```
+
+---
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `site '<slug>' already exists (state: ...)` | A previous run left a registry entry. | `sudo wp-delete <slug> --yes` first, OR re-run with `--resume <slug>` if the prior state was `failed`. |
+| `wp-mariadb not healthy` | Shared infra down or unhealthy. | `cd compose && docker compose up -d`; wait for healthcheck to pass. |
+| `wp-redis not running` | Same — shared infra. | Same fix. |
+| `Permission denied` writing `/opt/wp/secrets` | Not running as root. | Re-run with `sudo`. |
+| `_sanitize_slug: '<x>' sanitizes to empty` | Domain has no `[a-z0-9.-]` characters. | Use a real FQDN. |
+| `_sanitize_slug: '<s>' is reserved` | Slug equals `mariadb`, `redis`, or `network`. | Use a different domain. |
+| `_alloc_port: range 18000-18999 exhausted` | 1000 sites in use. | Out of scope for v1; bump `PORT_RANGE_END` in `_lib.sh`. |
+| Slug too long warning | Domain produces > 32 chars after sanitization. | Trim subdomain or accept truncation (it's a warning, not an error). |
+| `MARIADB_ROOT_PASSWORD not in env or compose/.env` | `compose/.env` missing or unreadable. | Recreate from `compose/.env.example` (mode 600). |
+| `wp-exec: container wp-<slug> not running` | Site is paused / failed. | `sudo wp-resume <slug>` first. |
+| 24h peaks render `-` everywhere | Phase 3's `wp-metrics-poll` not running yet. | Expected in Phase 2. |

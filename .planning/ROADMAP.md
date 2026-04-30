@@ -40,7 +40,14 @@
   3. `wp-list` shows all sites with slug/domain/status/port/redis DB/current mem/24h-peak mem and distinguishes `running` vs `paused`; `wp-list --secrets <slug>` re-displays creds without leaking to shell history; `wp-stats` prints a cluster line (`wp.slice` pool used / 4 GB total / 24h peak) and per-site rows sorted by 24h-peak mem; `wp-logs <site> [--follow]` and `wp-exec <site> <wp-cli-args>` work; `wp-pause <site>` stops the container (RAM freed, DB + files + secrets intact, registry state = `paused`) and `wp-resume <site>` starts it back; `wp-delete` removes container + DB + user + secrets and prints exact Caddy/Cloudflare cleanup snippets.
   4. Shared-pool memory model is enforced: every `wp-<site>` container runs under `--cgroup-parent=wp.slice` with no per-container `--memory` flag; provisioning rejects compose definitions that try to set one. `cat /sys/fs/cgroup/wp.slice/memory.max` returns `4294967296` (4 GB). One-site burst on the first real domain consumes >1 GB without affecting AudioStoryV2 (separate cgroup; pool isolation verified).
   5. The first real domain proves the cache promise: after the operator pastes the documented Cloudflare Cache Rule (cookie-bypass for `wordpress_logged_in_*` / `wp-postpass_` / `comment_author_`) and activates Super Page Cache for Cloudflare, logged-out homepage requests return `cf-cache-status: HIT` with TTFB under ~100 ms, while logged-in admin requests bypass cache and hit origin.
-**Plans**: TBD
+**Plans**: 7 plans
+- [ ] 02-PLAN-01-shared-lib.md — bin/_lib.sh shared bash helpers (state I/O, locking, allocators, secret gen, docker/WP-CLI wrappers)
+- [ ] 02-PLAN-02-templates.md — templates/ for per-site compose, wp-config extras, Caddy block, Cloudflare DNS rows, Cache Rule reference
+- [ ] 02-PLAN-03-wp-create.md — bin/wp-create with 14-step state machine, rollback trap, --resume, --dry-run, --json
+- [ ] 02-PLAN-04-wp-delete-pause-resume.md — bin/wp-delete (full teardown + cleanup snippets), bin/wp-pause (stop, free RAM), bin/wp-resume (restart)
+- [ ] 02-PLAN-05-wp-list-stats-logs-exec.md — bin/wp-list, bin/wp-stats, bin/wp-logs, bin/wp-exec inspection verbs
+- [ ] 02-PLAN-06-cli-docs-and-smoke-test.md — docs/cli.md reference, bin/_smoke-test.sh, README.md update
+- [ ] 02-PLAN-07-first-site-e2e-runbook.md — docs/first-site-e2e.md operator runbook for proving cf-cache-status: HIT
 
 ### Phase 3: Operational Tooling
 **Goal**: Adding the 5th–10th site is painless — cron is staggered, per-site usage is observable via the metrics-poll, and resource usage stays inside the 4 GB / 1 vCPU envelope under real load with mixed tiers.
