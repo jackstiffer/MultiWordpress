@@ -14,19 +14,13 @@ open.dirtyvocal.com {
 
 # WordPress site (block printed by `wp-create`)
 blog.dirtyvocal.com {
-    root * /opt/wp/sites/blog_dirtyvocal_com/wp-content
+    root * /opt/wp/sites/blog_dirtyvocal_com
     php_fastcgi 127.0.0.1:18001
 
-    @forbid_uploads_php {
-        path_regexp /wp-content/uploads/.*\.php$
-    }
-    respond @forbid_uploads_php 403
-    respond /xmlrpc.php 403
+    @uploads_php path_regexp ^/wp-content/uploads/.*\.php$
+    respond @uploads_php 403
 
     encode gzip zstd
-    log {
-        output discard
-    }
 }
 
 # Dashboard (Phase 4)

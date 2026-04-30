@@ -417,9 +417,13 @@ _step_create_db() {
 # -----------------------------------------------------------------------------
 _step_create_dirs() {
     _should_run_state "dirs_created" || { _log info "skip step 8 (already dirs_created)"; return 0; }
-    mkdir -p "${SITES_DIR}/${SLUG}/wp-content" || _die "mkdir failed for $SLUG"
-    chown -R "${WP_UID}:${WP_GID}" "${SITES_DIR}/${SLUG}" || _die "chown 82:82 failed for $SLUG"
-    _log info "created ${SITES_DIR}/${SLUG} (chown ${WP_UID}:${WP_GID})"
+    # Full-webroot bind mount: /opt/wp/sites/<slug> ↔ /var/www/html.
+    # Empty on first run; the upstream entrypoint copies WordPress core
+    # (index.php, wp-admin/, wp-includes/, wp-content/, wp-config-sample.php)
+    # into the bind-mounted dir on container start, owned by UID 82.
+    mkdir -p "${SITES_DIR}/${SLUG}" || _die "mkdir failed for $SLUG"
+    chown "${WP_UID}:${WP_GID}" "${SITES_DIR}/${SLUG}" || _die "chown ${WP_UID}:${WP_GID} failed for $SLUG"
+    _log info "created ${SITES_DIR}/${SLUG} (chown ${WP_UID}:${WP_GID}); upstream entrypoint will populate WP core"
     _advance_state "dirs_created"
 }
 

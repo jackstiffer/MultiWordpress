@@ -29,7 +29,12 @@ services:
       WORDPRESS_HOME: https://{{domain}}
       WORDPRESS_SITEURL: https://{{domain}}
     volumes:
-      - /opt/wp/sites/{{slug}}/wp-content:/var/www/html/wp-content
+      # Full webroot bind-mount. Caddy on host needs to see the same paths
+      # FPM sees (index.php, wp-admin/, wp-includes/, wp-content/) so its
+      # `root` directive points at one consistent path. The upstream
+      # entrypoint copies WordPress core into /var/www/html on first boot;
+      # those files land here on the host automatically (chowned to UID 82).
+      - /opt/wp/sites/{{slug}}:/var/www/html
     restart: unless-stopped
     # NOTE: shared infra (wp-mariadb, wp-redis) lives in a SEPARATE compose
     # project (compose/compose.yaml). Docker Compose `depends_on` cannot

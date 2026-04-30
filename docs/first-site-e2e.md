@@ -305,7 +305,7 @@ sudo wp-logs blog_dirtyvocal_com
 | `cf-cache-status: HIT` but TTFB > 200 ms | Edge not in your region, or curl over a slow link | Run from a different network. Cached HIT TTFB target is regional. |
 | Let's Encrypt cert fails | Cloudflare SSL mode is "Flexible" or "Off" | Cloudflare → SSL/TLS → set to **Full (strict)**. Ensure host Caddy can reach `:80` from the internet (firewall). |
 | Origin slow on MISS | `redis-cache` not active inside the site | `sudo wp-exec <slug> redis status` should report `Connected`. If not, `sudo wp-exec <slug> redis enable`. |
-| `Permission denied` writing uploads | UID mismatch on bind mount | `sudo chown -R 82:82 /opt/wp/sites/<slug>/wp-content` (Phase 1 image runs as UID 82). |
+| `Permission denied` writing uploads | UID mismatch on bind mount | `sudo chown -R 82:82 /opt/wp/sites/<slug>` (the full webroot bind-mount; image runs as UID 82). |
 | WooCommerce cart shows stale empty cart | `woocommerce_*` cookies not in bypass list | Step 4 includes both `woocommerce_items_in_cart` and `woocommerce_cart_hash` — verify both are in the rule. |
 | Plugin install network error | WP.org repo unreachable from VM | Retry; or download zip and `wp-exec <slug> plugin install /path/to/plugin.zip`. |
 

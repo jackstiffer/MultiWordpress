@@ -1,20 +1,11 @@
 {{domain}} {
-    # Reverse-proxy WordPress FPM at 127.0.0.1:{{port}} (loopback only).
-    root * /opt/wp/sites/{{slug}}/wp-content
+    root * /opt/wp/sites/{{slug}}
     php_fastcgi 127.0.0.1:{{port}}
 
-    # Defense-in-depth: block PHP execution under uploads/.
-    @forbid_uploads_php {
-        path_regexp /wp-content/uploads/.*\.php$
-    }
-    respond @forbid_uploads_php 403
-
-    # XML-RPC disabled (HARD-02). The wp-config filters back this up.
-    respond /xmlrpc.php 403
+    # Defense-in-depth: block PHP execution under uploads/ (in case a
+    # malicious upload bypasses WordPress's MIME sanitization).
+    @uploads_php path_regexp ^/wp-content/uploads/.*\.php$
+    respond @uploads_php 403
 
     encode gzip zstd
-
-    log {
-        output discard
-    }
 }
