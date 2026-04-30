@@ -17,7 +17,7 @@ In GCP console → **Compute Engine** → **VM instances** → **Create instance
 | Name | `multiwp-test` (or whatever) |
 | Region/Zone | Same region as your production VM (`us-central1` for `dirtyvocal-nextjs`) |
 | Machine type | **`n2-standard-2`** (2 vCPU, 8 GB) — match production for realistic test |
-| Boot disk | **Ubuntu 22.04 LTS**, **20 GB** standard persistent disk (SSD) |
+| Boot disk | **Ubuntu 22.04+ LTS** *or* **Debian 12 (bookworm)** — both have cgroup v2 by default. **20 GB** standard persistent disk (SSD). |
 | Firewall | Allow HTTP traffic, Allow HTTPS traffic (both checked) |
 
 Or via `gcloud` CLI from your local machine:
@@ -68,18 +68,30 @@ Must return **`cgroup2fs`**. Ubuntu 22.04+ uses cgroup v2 by default — if you 
 
 ### 2.3 Install Docker (official Docker Engine, not docker.io)
 
-The `docker.io` package in Ubuntu's default repo is older. Use Docker's official repo:
+The distro-shipped `docker.io` package is older. Use Docker's official apt repo. **The repo path differs by distro** (Debian and Ubuntu have separate URLs), so detect it:
 
 ```bash
+# Detect distro family — sets DOCKER_DISTRO to "ubuntu" or "debian"
+. /etc/os-release
+case "$ID" in
+  ubuntu) DOCKER_DISTRO=ubuntu ;;
+  debian) DOCKER_DISTRO=debian ;;
+  *)
+    echo "Unsupported distro: $ID. This guide covers Ubuntu and Debian only."
+    exit 1
+    ;;
+esac
+echo "Using Docker repo for: $DOCKER_DISTRO ($VERSION_CODENAME)"
+
 # Add Docker's GPG key
 sudo install -m 0755 -d /etc/apt/keyrings
-sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+sudo curl -fsSL "https://download.docker.com/linux/${DOCKER_DISTRO}/gpg" -o /etc/apt/keyrings/docker.asc
 sudo chmod a+r /etc/apt/keyrings/docker.asc
 
-# Add Docker repo
+# Add Docker repo (correct distro path)
 echo \
-  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
-  $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/${DOCKER_DISTRO} \
+  ${VERSION_CODENAME} stable" | \
   sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
 
 sudo apt update
@@ -96,6 +108,13 @@ sudo systemctl enable --now docker
 # Verify
 docker --version
 docker compose version       # plugin form, not docker-compose binary
+```
+
+**If you got a `404 Not Found` on `download.docker.com/.../bookworm/Release`** during a previous run, that's the symptom of pointing at the wrong distro path (`ubuntu` URL with a Debian codename like `bookworm`, or vice versa). Recover with:
+
+```bash
+sudo rm /etc/apt/sources.list.d/docker.list
+# Then re-run the block above — it auto-detects this time.
 ```
 
 ### 2.4 Install Caddy
@@ -413,7 +432,8 @@ gcloud compute instances delete multiwp-test --zone=us-central1-c
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `cgroup v2 not detected` during install-wp-slice.sh | Older Ubuntu (20.04 or earlier) | Recreate VM with Ubuntu 22.04+ |
+| `cgroup v2 not detected` during install-wp-slice.sh | Older Ubuntu (20.04 or earlier) or Debian 10 | Recreate VM with Ubuntu 22.04+ or Debian 12+ |
+| `404 Not Found` on `download.docker.com/.../<codename>/Release` during Docker install | Wrong distro path in `/etc/apt/sources.list.d/docker.list` (Ubuntu URL with Debian codename, or vice versa) | `sudo rm /etc/apt/sources.list.d/docker.list` then re-run the auto-detecting Docker install block in §2.3 |
 | `Permission denied` reaching `/opt/wp/secrets/` | Not running as root | `sudo` everything |
 | `port is already allocated` on `docker compose up` | AudioStoryV2 already running on this VM with conflicting port (only happens if you deploy on the prod VM directly) | Use a *dummy* VM for testing |
 | `522 Connection Timed Out` from Cloudflare | Caddy not reloaded, or firewall blocking 443 | `sudo systemctl reload caddy`; verify GCP firewall has http-server + https-server tags |
