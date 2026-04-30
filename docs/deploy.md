@@ -167,20 +167,24 @@ Expected output: cgroup v2 verified, slice installed, `memory.max=4294967296` co
 
 If it fails with "cgroup v1 detected" — your VM is older than expected. Either bump to Ubuntu 22.04+, or recreate the VM with the right image family.
 
-### 4.2 Configure shared-infra secrets
+### 4.2 Generate shared-infra secrets
+
+One script handles it — generates a random `MARIADB_ROOT_PASSWORD`, writes
+`/opt/wp/compose/.env` (mode 600), and symlinks `/opt/wp/.env` so the CLI
+finds the secret at the expected path. Idempotent: re-running on a host
+that already has a real password is a no-op.
 
 ```bash
-sudo cp /opt/wp/compose/.env.example /opt/wp/compose/.env
+cd /opt/wp
+sudo bash host/init-secrets.sh
+```
 
-# Generate a strong password and put it in the .env
-sudo bash -c 'echo "MARIADB_ROOT_PASSWORD=$(openssl rand -base64 24 | tr -d /=+)" >> /opt/wp/compose/.env'
+Verify:
 
-# The CLI also reads from /opt/wp/.env — symlink it
-sudo ln -sf /opt/wp/compose/.env /opt/wp/.env
-
-# Verify
-sudo cat /opt/wp/.env       # should show MARIADB_ROOT_PASSWORD=<random32>
-sudo chmod 600 /opt/wp/compose/.env /opt/wp/.env
+```bash
+sudo cat /opt/wp/.env       # MARIADB_ROOT_PASSWORD=<48-hex-chars>
+ls -la /opt/wp/.env         # symlink → compose/.env
+ls -la /opt/wp/compose/.env # mode 600, owner root
 ```
 
 ### 4.3 Bring up shared infra
