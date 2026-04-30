@@ -118,17 +118,64 @@ Deferred. Tracked, not in current roadmap.
 
 ## Traceability
 
-Populated by roadmapper during roadmap creation.
-
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| (pending roadmap) | — | Pending |
+| INFRA-01 | Phase 1 | Pending |
+| INFRA-02 | Phase 1 | Pending |
+| INFRA-03 | Phase 1 | Pending |
+| INFRA-04 | Phase 1 | Pending |
+| INFRA-05 | Phase 1 | Pending |
+| INFRA-06 | Phase 1 | Pending |
+| IMG-01 | Phase 1 | Pending |
+| IMG-02 | Phase 1 | Pending |
+| IMG-03 | Phase 1 | Pending |
+| IMG-04 | Phase 1 | Pending |
+| IMG-05 | Phase 1 | Pending |
+| IMG-06 | Phase 1 | Pending |
+| CLI-01 | Phase 2 | Pending |
+| CLI-02 | Phase 2 | Pending |
+| CLI-03 | Phase 2 | Pending |
+| CLI-04 | Phase 2 | Pending |
+| CLI-05 | Phase 2 | Pending |
+| CLI-06 | Phase 2 | Pending |
+| CLI-07 | Phase 2 | Pending |
+| CLI-08 | Phase 2 | Pending |
+| CLI-09 | Phase 2 | Pending |
+| CLI-10 | Phase 2 | Pending |
+| CLI-11 | Phase 2 | Pending |
+| CLI-12 | Phase 2 | Pending |
+| CLI-13 | Phase 2 | Pending |
+| STATE-01 | Phase 2 | Pending |
+| STATE-02 | Phase 2 | Pending |
+| STATE-03 | Phase 2 | Pending |
+| STATE-04 | Phase 2 | Pending |
+| PERF-01 | Phase 2 | Pending |
+| PERF-02 | Phase 2 | Pending |
+| PERF-03 | Phase 3 | Pending |
+| HARD-01 | Phase 1 | Pending |
+| HARD-02 | Phase 2 | Pending |
+| HARD-03 | Phase 1 | Pending |
+| DASH-01 | Phase 4 | Pending |
+| DASH-02 | Phase 4 | Pending |
+| DASH-03 | Phase 4 | Pending |
+| DOC-01 | Phase 4 | Pending |
+| DOC-02 | Phase 4 | Pending |
+| DOC-03 | Phase 4 | Pending |
 
 **Coverage:**
 - v1 requirements: 36 total
-- Mapped to phases: 0 (pending roadmap)
-- Unmapped: 36 ⚠️
+- Mapped to phases: 36 ✓
+- Unmapped: 0
+
+### By Phase
+
+| Phase | Count | Requirements |
+|-------|-------|--------------|
+| Phase 1: Foundation | 14 | INFRA-01..06, IMG-01..06, HARD-01, HARD-03 |
+| Phase 2: CLI Core + First Site E2E | 19 | CLI-01..13, STATE-01..04, PERF-01, PERF-02, HARD-02 |
+| Phase 3: Operational Tooling | 1 | PERF-03 |
+| Phase 4: Polish — Dashboard + Docs | 6 | DASH-01..03, DOC-01..03 |
 
 ---
 *Requirements defined: 2026-04-30*
-*Last updated: 2026-04-30 after initialization*
+*Last updated: 2026-04-30 after roadmap creation (traceability populated)*
