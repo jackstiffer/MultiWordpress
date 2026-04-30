@@ -1,0 +1,775 @@
+#!/usr/bin/env bash
+# =============================================================================
+# bin/wp-create — provision a new WordPress site end-to-end.
+# =============================================================================
+#
+# Usage:
+#   wp-create <domain> [--admin-email <email>] [--resume <slug>]
+#                      [--dry-run] [--json] [-h|--help]
+#
+# 14-step provisioning sequence (see 02-CONTEXT.md):
+#   1. Validate slug          \
+#   2. Acquire allocator lock  \
+#   3. Allocate port            >  → state: allocating (transient)
+#   4. Allocate redis_db        |
+#   5. Generate secrets         |
+#   6. Persist .env mode 600   /
+#   7. Create DB + user + GRANT (verify scope)         → db_created
+#   8. Create dirs, chown 82:82                         → dirs_created
+#   9. Render per-site compose.yaml
+#   10. docker compose up -d, wait healthy             → container_booted
+#   11. wp core install                                 → wp_installed
+#   12. install + activate redis-cache; wp redis enable
+#   13. Inject wp-config-extras.php
+#   14. Print summary block (Caddy + Cloudflare)       → finalized
+#
+# ERR trap calls _rollback in REVERSE state order. State machine names are
+# canonical (see 02-CONTEXT.md "State Machine Transitions" — not discretionary).
+# =============================================================================
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=_lib.sh
+source "$SCRIPT_DIR/_lib.sh"
+
+# -----------------------------------------------------------------------------
+# Globals — populated by argument parsing / setup
+# -----------------------------------------------------------------------------
+DOMAIN=""
+ADMIN_EMAIL=""
+RESUME_SLUG=""
+DRY_RUN=0
+JSON_MODE=0
+
+SLUG=""
+PORT=""
+REDIS_DB=""
+DB_PASSWORD=""
+WP_ADMIN_USER=""
+WP_ADMIN_PASSWORD=""
+SECRETS_FILE=""
+COMPOSE_FILE=""
+
+# Current state (in-memory mirror of sites.json[slug].state). Used by _rollback.
+CURRENT_STATE=""
+ROLLBACK_ARMED=0
+
+# -----------------------------------------------------------------------------
+# Usage
+# -----------------------------------------------------------------------------
+_usage() {
+    cat >&2 <<'EOF'
+wp-create — provision a WordPress site
+
+Usage:
+  wp-create <domain> [--admin-email <email>] [--resume <slug>]
+                     [--dry-run] [--json] [-h|--help]
+
+Arguments:
+  <domain>             Fully-qualified domain name (e.g. blog.example.com).
+
+Options:
+  --admin-email EMAIL  WP admin email (default: admin@<domain>).
+  --resume SLUG        Continue a partial provisioning from last completed
+                       state (sites.json entry must exist).
+  --dry-run            Validate slug + show planned port/redis_db without
+                       mutating any host state. No DB writes, no docker calls.
+  --json               Emit final summary as JSON instead of human-readable.
+  -h, --help           Show this help.
+
+Examples:
+  sudo wp-create blog.example.com
+  sudo wp-create blog.example.com --admin-email me@example.com
+  sudo wp-create --resume blog_example_com
+  wp-create --dry-run blog.example.com
+EOF
+}
+
+# -----------------------------------------------------------------------------
+# Argument parsing
+# -----------------------------------------------------------------------------
+_parse_args() {
+    if [[ $# -eq 0 ]]; then
+        _usage
+        exit 2
+    fi
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)        _usage; exit 0 ;;
+            --admin-email)    [[ $# -ge 2 ]] || _die "--admin-email requires a value"
+                              ADMIN_EMAIL="$2"; shift 2 ;;
+            --resume)         [[ $# -ge 2 ]] || _die "--resume requires a slug"
+                              RESUME_SLUG="$2"; shift 2 ;;
+            --dry-run)        DRY_RUN=1; shift ;;
+            --json)           JSON_MODE=1; _JSON_MODE=1; shift ;;
+            --)               shift; break ;;
+            -*)               _usage; _die "unknown flag: $1" ;;
+            *)                if [[ -z "$DOMAIN" ]]; then
+                                  DOMAIN="$1"
+                              else
+                                  _usage; _die "unexpected positional arg: $1"
+                              fi
+                              shift ;;
+        esac
+    done
+
+    if [[ -z "$DOMAIN" && -z "$RESUME_SLUG" ]]; then
+        _usage
+        _die "<domain> is required (or use --resume <slug>)"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Pre-flight checks — directories, root, required commands, shared infra.
+# -----------------------------------------------------------------------------
+_preflight() {
+    _require_cmd docker
+    _require_cmd jq
+    _require_cmd openssl
+    _require_cmd flock
+    _require_cmd sed
+
+    if (( DRY_RUN == 0 )); then
+        _require_root
+
+        # Ensure host directories exist.
+        local d
+        for d in "$STATE_DIR" "$SECRETS_DIR" "$SITES_DIR"; do
+            [[ -d "$d" ]] || mkdir -p "$d" || _die "cannot create $d"
+        done
+        chmod 700 "$SECRETS_DIR" 2>/dev/null || true
+
+        _init_state
+
+        # wp.slice cgroup must be active (host/install-wp-slice.sh in Phase 1).
+        if [[ ! -e /sys/fs/cgroup/wp.slice ]]; then
+            _die "wp.slice not active; run host/install-wp-slice.sh first"
+        fi
+
+        # wp-network must exist.
+        docker network inspect "$COMPOSE_NETWORK" >/dev/null 2>&1 \
+            || _die "docker network '$COMPOSE_NETWORK' missing; bring up shared infra"
+
+        # Shared infra health (per Phase 2 deviation: per-site compose has NO
+        # depends_on for wp-mariadb/wp-redis — they live in a separate compose
+        # project). Assert health here before launching anything.
+        local mariadb_health redis_status
+        mariadb_health="$(docker inspect wp-mariadb --format '{{.State.Health.Status}}' 2>/dev/null || true)"
+        [[ "$mariadb_health" == "healthy" ]] \
+            || _die "wp-mariadb not healthy (status: ${mariadb_health:-missing}); start shared infra first"
+        redis_status="$(docker inspect wp-redis --format '{{.State.Status}}' 2>/dev/null || true)"
+        [[ "$redis_status" == "running" ]] \
+            || _die "wp-redis not running (status: ${redis_status:-missing}); start shared infra first"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Slug derivation + existing-site guard
+# -----------------------------------------------------------------------------
+_derive_slug_and_guard() {
+    if [[ -n "$RESUME_SLUG" ]]; then
+        SLUG="$RESUME_SLUG"
+        local entry
+        entry="$(_get_site "$SLUG")"
+        [[ -n "$entry" ]] || _die "--resume: no sites.json entry for slug '$SLUG'"
+
+        # Pull domain + admin_email from entry if not overridden.
+        if [[ -z "$DOMAIN" ]]; then
+            DOMAIN="$(printf '%s' "$entry" | jq -r '.domain // empty')"
+        fi
+        [[ -n "$DOMAIN" ]] || _die "--resume: existing entry has no .domain; cannot continue"
+
+        CURRENT_STATE="$(printf '%s' "$entry" | jq -r '.state // empty')"
+        PORT="$(printf '%s' "$entry" | jq -r '.port // empty')"
+        REDIS_DB="$(printf '%s' "$entry" | jq -r '.redis_db // empty')"
+
+        _log info "resuming site '$SLUG' from state '${CURRENT_STATE:-allocating}' (port=$PORT redis_db=$REDIS_DB)"
+    else
+        SLUG="$(_sanitize_slug "$DOMAIN")" || _die "could not derive slug from '$DOMAIN'"
+        local entry existing_state
+        entry="$(_get_site "$SLUG" 2>/dev/null || true)"
+        if [[ -n "$entry" ]]; then
+            existing_state="$(printf '%s' "$entry" | jq -r '.state // "unknown"')"
+            if [[ "$existing_state" == "failed" ]]; then
+                _die "site '$SLUG' exists in state 'failed'; re-run with --resume $SLUG (or wp-delete first)"
+            else
+                _die "site '$SLUG' already exists (state: $existing_state); run wp-delete first"
+            fi
+        fi
+        CURRENT_STATE=""
+    fi
+
+    [[ -z "$ADMIN_EMAIL" ]] && ADMIN_EMAIL="admin@${DOMAIN}"
+    SECRETS_FILE="${SECRETS_DIR}/${SLUG}.env"
+    COMPOSE_FILE="${SITES_DIR}/${SLUG}/compose.yaml"
+}
+
+# -----------------------------------------------------------------------------
+# State machine helpers
+# -----------------------------------------------------------------------------
+# Numeric rank for state ordering (used by rollback + resume).
+_state_rank() {
+    case "$1" in
+        ""|"allocating")    echo 0 ;;
+        "db_created")       echo 1 ;;
+        "dirs_created")     echo 2 ;;
+        "container_booted") echo 3 ;;
+        "wp_installed")     echo 4 ;;
+        "finalized")        echo 5 ;;
+        "failed")           echo -1 ;;
+        *)                  echo 0 ;;
+    esac
+}
+
+# True (0) if we should run the step that transitions TO <new_state>.
+_should_run_state() {
+    local target="$1"
+    local cur_rank tgt_rank
+    cur_rank="$(_state_rank "$CURRENT_STATE")"
+    tgt_rank="$(_state_rank "$target")"
+    (( cur_rank < tgt_rank ))
+}
+
+_advance_state() {
+    local new_state="$1"
+    local ts cur new
+    ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    cur="$(_load_state)"
+    new="$(printf '%s' "$cur" | jq \
+        --arg s "$SLUG" \
+        --arg ns "$new_state" \
+        --arg ts "$ts" \
+        '
+        .sites[$s].state = $ns
+        | .sites[$s].state_history =
+            ((.sites[$s].state_history // []) + [{state: $ns, ts: $ts}])
+        ')" || _die "_advance_state: jq failed"
+    _save_state "$new"
+    CURRENT_STATE="$new_state"
+    _log info "state → $new_state"
+}
+
+# -----------------------------------------------------------------------------
+# Rollback — reverse the state machine. Called via trap on ERR.
+# -----------------------------------------------------------------------------
+_rollback() {
+    local exit_code="${1:-$?}"
+    # Disarm so nested errors during rollback don't recurse.
+    trap - ERR
+    ROLLBACK_ARMED=0
+
+    _log error "provisioning failed at state '${CURRENT_STATE:-pre-db}' (exit=$exit_code); rolling back $SLUG"
+
+    local rank
+    rank="$(_state_rank "$CURRENT_STATE")"
+
+    # Reverse order: stop container → remove dirs → drop DB.
+    if (( rank >= 3 )); then
+        if [[ -f "$COMPOSE_FILE" ]]; then
+            _log warn "rollback: docker compose down for $SLUG"
+            docker compose -f "$COMPOSE_FILE" down 2>/dev/null || \
+                _log warn "rollback: compose down had errors (continuing)"
+        fi
+    fi
+
+    if (( rank >= 2 )); then
+        if [[ -d "${SITES_DIR}/${SLUG}" ]]; then
+            _log warn "rollback: rm -rf ${SITES_DIR}/${SLUG}"
+            rm -rf "${SITES_DIR:?}/${SLUG}" 2>/dev/null || \
+                _log warn "rollback: rm had errors (continuing)"
+        fi
+    fi
+
+    if (( rank >= 1 )); then
+        _log warn "rollback: dropping DB + user wp_${SLUG}"
+        _db_drop_site "$SLUG" || _log warn "rollback: _db_drop_site had errors"
+    fi
+
+    # Mark entry failed (preserve for --resume diagnosis; do NOT delete).
+    if [[ -n "$SLUG" ]]; then
+        local cur new ts
+        ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+        cur="$(_load_state)"
+        if printf '%s' "$cur" | jq -e --arg s "$SLUG" '.sites[$s]' >/dev/null 2>&1; then
+            new="$(printf '%s' "$cur" | jq \
+                --arg s "$SLUG" --arg ts "$ts" \
+                '.sites[$s].state = "failed"
+                 | .sites[$s].state_history =
+                    ((.sites[$s].state_history // []) + [{state: "failed", ts: $ts}])')" \
+                || true
+            [[ -n "$new" ]] && _save_state "$new" || true
+        fi
+    fi
+
+    _log error "rollback complete; site '$SLUG' marked failed (state was: ${CURRENT_STATE:-pre-db})"
+    exit "$exit_code"
+}
+
+# -----------------------------------------------------------------------------
+# Allocator — runs under flock. Persists provisional sites.json entry.
+# -----------------------------------------------------------------------------
+_allocate_resources() {
+    # Already allocated (either resume or re-entry under same lock).
+    if [[ -n "$PORT" && -n "$REDIS_DB" ]]; then
+        return 0
+    fi
+
+    PORT="$(_alloc_port)"
+    REDIS_DB="$(_alloc_redis_db)"
+
+    local ts created_at fragment
+    ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    created_at="$ts"
+    fragment="$(jq -n \
+        --arg domain "$DOMAIN" \
+        --arg slug   "$SLUG" \
+        --argjson port "$PORT" \
+        --argjson rdb  "$REDIS_DB" \
+        --arg state  "allocating" \
+        --arg ts     "$ts" \
+        --arg created_at "$created_at" \
+        '{
+            domain:        $domain,
+            slug:          $slug,
+            port:          $port,
+            redis_db:      $rdb,
+            state:         $state,
+            state_history: [{state: $state, ts: $ts}],
+            created_at:    $created_at
+        }')"
+    _state_set_site "$SLUG" "$fragment"
+    CURRENT_STATE="allocating"
+    _log info "allocated port=$PORT redis_db=$REDIS_DB for $SLUG"
+}
+
+# -----------------------------------------------------------------------------
+# Secrets generation — writes /opt/wp/secrets/<slug>.env mode 600.
+# Idempotent on resume: if file exists & non-empty, re-read values.
+# -----------------------------------------------------------------------------
+_generate_secrets() {
+    if [[ -f "$SECRETS_FILE" && -s "$SECRETS_FILE" ]]; then
+        _log info "secrets file exists; reading existing values"
+        # Source in subshell-safe way: parse KEY=VALUE lines.
+        DB_PASSWORD="$(grep -E '^DB_PASSWORD=' "$SECRETS_FILE" | head -n1 | cut -d= -f2-)"
+        WP_ADMIN_USER="$(grep -E '^WP_ADMIN_USER=' "$SECRETS_FILE" | head -n1 | cut -d= -f2-)"
+        WP_ADMIN_PASSWORD="$(grep -E '^WP_ADMIN_PASSWORD=' "$SECRETS_FILE" | head -n1 | cut -d= -f2-)"
+        [[ -n "$DB_PASSWORD" && -n "$WP_ADMIN_USER" && -n "$WP_ADMIN_PASSWORD" ]] \
+            || _die "secrets file $SECRETS_FILE incomplete; delete and retry"
+        return 0
+    fi
+
+    DB_PASSWORD="$(_gen_secret 32)"
+    WP_ADMIN_USER="$(_gen_admin_user)"
+    WP_ADMIN_PASSWORD="$(_gen_secret 24)"
+
+    local tmp="${SECRETS_FILE}.tmp.$$"
+    umask 077
+    {
+        printf 'SLUG=%s\n'              "$SLUG"
+        printf 'DOMAIN=%s\n'            "$DOMAIN"
+        printf 'PORT=%s\n'              "$PORT"
+        printf 'REDIS_DB=%s\n'          "$REDIS_DB"
+        printf 'DB_NAME=wp_%s\n'        "$SLUG"
+        printf 'DB_USER=wp_%s\n'        "$SLUG"
+        printf 'DB_PASSWORD=%s\n'       "$DB_PASSWORD"
+        printf 'WP_ADMIN_USER=%s\n'     "$WP_ADMIN_USER"
+        printf 'WP_ADMIN_PASSWORD=%s\n' "$WP_ADMIN_PASSWORD"
+        printf 'WP_ADMIN_EMAIL=%s\n'    "$ADMIN_EMAIL"
+        _gen_wp_salts
+    } > "$tmp" || _die "could not write $tmp"
+    chmod 600 "$tmp"
+    chown root:root "$tmp" 2>/dev/null || true
+    mv "$tmp" "$SECRETS_FILE" || _die "could not rename $tmp -> $SECRETS_FILE"
+    _log info "wrote secrets file $SECRETS_FILE (mode 600)"
+}
+
+# -----------------------------------------------------------------------------
+# Step 7 — DB + user + GRANT (verify scope)
+# -----------------------------------------------------------------------------
+_step_create_db() {
+    _should_run_state "db_created" || { _log info "skip step 7 (already db_created)"; return 0; }
+
+    _db_create_site "$SLUG" "$DB_PASSWORD"
+
+    # Belt-and-suspenders: explicit SHOW GRANTS scope check (matches plan spec).
+    local grants
+    grants="$(_db_exec "SHOW GRANTS FOR 'wp_${SLUG}'@'%';" 2>&1)"
+    printf '%s\n' "$grants" | grep -q "wp_${SLUG}" \
+        || _die "SHOW GRANTS: no grant on wp_${SLUG}.* for wp_${SLUG}"
+    if printf '%s\n' "$grants" | grep -E 'GRANT .* ON \*\.\*' | grep -qv 'USAGE ON \*\.\*'; then
+        _die "SHOW GRANTS: wildcard privileges detected on wp_${SLUG} — aborting"
+    fi
+    # MAX_USER_CONNECTIONS is set on the user (ALTER USER), not in GRANTS output
+    # on modern MariaDB. Verify via mysql.user / information_schema.
+    local muc
+    muc="$(_db_exec "SELECT max_user_connections FROM mysql.user WHERE User='wp_${SLUG}' AND Host='%';" 2>/dev/null \
+            | tail -n1 | tr -d '[:space:]')"
+    [[ "$muc" == "${DB_MAX_USER_CONNECTIONS}" ]] \
+        || _die "MAX_USER_CONNECTIONS verify failed for wp_${SLUG}: got '$muc', expected ${DB_MAX_USER_CONNECTIONS}"
+    _log info "verified GRANTS scoped to wp_${SLUG}.* with MAX_USER_CONNECTIONS ${DB_MAX_USER_CONNECTIONS}"
+
+    _advance_state "db_created"
+}
+
+# -----------------------------------------------------------------------------
+# Step 8 — dirs + chown
+# -----------------------------------------------------------------------------
+_step_create_dirs() {
+    _should_run_state "dirs_created" || { _log info "skip step 8 (already dirs_created)"; return 0; }
+    mkdir -p "${SITES_DIR}/${SLUG}/wp-content" || _die "mkdir failed for $SLUG"
+    chown -R "${WP_UID}:${WP_GID}" "${SITES_DIR}/${SLUG}" || _die "chown 82:82 failed for $SLUG"
+    _log info "created ${SITES_DIR}/${SLUG} (chown ${WP_UID}:${WP_GID})"
+    _advance_state "dirs_created"
+}
+
+# -----------------------------------------------------------------------------
+# Template render — pure-bash {{placeholder}} substitution.
+# -----------------------------------------------------------------------------
+_render_template() {
+    local tmpl="$1"; shift
+    [[ -f "$tmpl" ]] || _die "_render_template: missing template $tmpl"
+    local content
+    content="$(<"$tmpl")"
+    while [[ $# -ge 2 ]]; do
+        # Replace ALL occurrences of {{key}} with value.
+        local key="$1" val="$2"
+        content="${content//\{\{${key}\}\}/${val}}"
+        shift 2
+    done
+    printf '%s' "$content"
+}
+
+# -----------------------------------------------------------------------------
+# Steps 9 + 10 — render compose, boot container, wait healthy.
+# -----------------------------------------------------------------------------
+_step_boot_container() {
+    _should_run_state "container_booted" || { _log info "skip steps 9-10 (already container_booted)"; return 0; }
+
+    local tmpl="${SCRIPT_DIR}/../templates/site.compose.yaml.tmpl"
+    [[ -f "$tmpl" ]] || tmpl="$(dirname "$SCRIPT_DIR")/templates/site.compose.yaml.tmpl"
+    [[ -f "$tmpl" ]] || _die "site.compose.yaml.tmpl not found"
+
+    local rendered
+    rendered="$(_render_template "$tmpl" \
+        slug "$SLUG" \
+        port "$PORT" \
+        redis_db "$REDIS_DB" \
+        domain "$DOMAIN")"
+
+    mkdir -p "${SITES_DIR}/${SLUG}"
+    printf '%s\n' "$rendered" > "$COMPOSE_FILE" || _die "could not write $COMPOSE_FILE"
+    chmod 644 "$COMPOSE_FILE"
+    _log info "rendered compose → $COMPOSE_FILE"
+
+    # docker compose reads the per-site env_file at runtime; we also need
+    # DB_NAME/DB_USER/DB_PASSWORD/REDIS_DB visible to compose's variable
+    # substitution at *render* time (the template uses ${DB_NAME} etc.).
+    # Easiest: pass the secrets file as --env-file.
+    docker compose --env-file "$SECRETS_FILE" -f "$COMPOSE_FILE" up -d \
+        || _die "docker compose up -d failed for $SLUG"
+
+    # Wait for container running + FastCGI port reachable on loopback.
+    local deadline=$(( $(date +%s) + 60 ))
+    local container="wp-${SLUG}"
+    while (( $(date +%s) < deadline )); do
+        local status
+        status="$(docker inspect "$container" --format '{{.State.Status}}' 2>/dev/null || echo missing)"
+        if [[ "$status" == "running" ]]; then
+            # Check FastCGI socket on loopback (cgi-fcgi is rare; use bash /dev/tcp).
+            if (echo > "/dev/tcp/127.0.0.1/${PORT}") >/dev/null 2>&1; then
+                break
+            fi
+        fi
+        sleep 1
+    done
+    local final_status
+    final_status="$(docker inspect "$container" --format '{{.State.Status}}' 2>/dev/null || echo missing)"
+    [[ "$final_status" == "running" ]] || _die "container $container not running (status: $final_status)"
+    (echo > "/dev/tcp/127.0.0.1/${PORT}") >/dev/null 2>&1 \
+        || _die "FastCGI port 127.0.0.1:${PORT} not reachable after 60s"
+
+    local cid
+    cid="$(docker inspect "$container" --format '{{.Id}}' 2>/dev/null || true)"
+    if [[ -n "$cid" ]]; then
+        local frag
+        frag="$(jq -n --arg id "$cid" '{container_id: $id}')"
+        _state_set_site "$SLUG" "$frag"
+    fi
+
+    _log info "container $container up; FastCGI on 127.0.0.1:${PORT}"
+    _advance_state "container_booted"
+}
+
+# -----------------------------------------------------------------------------
+# Step 11 — wp core install
+# -----------------------------------------------------------------------------
+_step_wp_install() {
+    _should_run_state "wp_installed" || { _log info "skip step 11 (already wp_installed)"; return 0; }
+
+    # WP-CLI may need a moment for php-fpm to fully accept work after socket up.
+    local attempts=0
+    until _wp_exec "$SLUG" core is-installed >/dev/null 2>&1; do
+        attempts=$((attempts+1))
+        if (( attempts == 1 )); then
+            _wp_exec "$SLUG" core install \
+                --url="https://${DOMAIN}" \
+                --title="${DOMAIN}" \
+                --admin_user="${WP_ADMIN_USER}" \
+                --admin_password="${WP_ADMIN_PASSWORD}" \
+                --admin_email="${ADMIN_EMAIL}" \
+                --skip-email \
+                || { (( attempts < 3 )) && sleep 2 && continue; _die "wp core install failed for $SLUG"; }
+        elif (( attempts >= 5 )); then
+            _die "wp core install: site reports not-installed after $attempts attempts"
+        else
+            sleep 2
+        fi
+    done
+
+    _log info "wp core install complete (admin: $WP_ADMIN_USER)"
+    _advance_state "wp_installed"
+}
+
+# -----------------------------------------------------------------------------
+# Steps 12 + 13 — redis-cache plugin, wp-config-extras injection.
+# -----------------------------------------------------------------------------
+_step_finalize_wp() {
+    _should_run_state "finalized" || { _log info "skip steps 12-14 (already finalized)"; return 0; }
+
+    # 12. redis-cache plugin
+    _wp_exec "$SLUG" plugin install redis-cache --activate \
+        || _die "wp plugin install redis-cache failed"
+    _wp_exec "$SLUG" redis enable \
+        || _die "wp redis enable failed"
+    _log info "redis-cache enabled"
+
+    # 13. wp-config-extras injection.
+    local tmpl="${SCRIPT_DIR}/../templates/wp-config-extras.php.tmpl"
+    [[ -f "$tmpl" ]] || tmpl="$(dirname "$SCRIPT_DIR")/templates/wp-config-extras.php.tmpl"
+    [[ -f "$tmpl" ]] || _die "wp-config-extras.php.tmpl not found"
+
+    local container="wp-${SLUG}"
+    docker cp "$tmpl" "${container}:/var/www/html/wp-config-extras.php" \
+        || _die "docker cp wp-config-extras.php failed"
+    docker exec -u root "$container" chown "${WP_UID}:${WP_GID}" /var/www/html/wp-config-extras.php \
+        || _log warn "could not chown wp-config-extras.php (continuing)"
+
+    # Append `require_once` ABOVE "/* That's all, stop editing!" line — only once.
+    docker exec -u root "$container" sh -c '
+        set -e
+        f=/var/www/html/wp-config.php
+        if grep -q "wp-config-extras.php" "$f"; then
+            exit 0
+        fi
+        # Insert require_once line before the "stop editing" comment.
+        if grep -q "stop editing" "$f"; then
+            sed -i "/stop editing/i require_once __DIR__ . \"/wp-config-extras.php\";" "$f"
+        else
+            printf "\nrequire_once __DIR__ . \"/wp-config-extras.php\";\n" >> "$f"
+        fi
+    ' || _die "wp-config.php require_once injection failed"
+
+    # Verify DISABLE_WP_CRON took effect.
+    local verify
+    verify="$(_wp_exec "$SLUG" eval 'echo (defined("DISABLE_WP_CRON") && DISABLE_WP_CRON) ? "ok" : "fail";' 2>/dev/null || true)"
+    if [[ "$verify" != *ok* ]]; then
+        _log warn "wp-config-extras verify: DISABLE_WP_CRON not active (got: $verify)"
+    else
+        _log info "wp-config-extras verified (DISABLE_WP_CRON active)"
+    fi
+
+    # 14. mark finalized
+    _advance_state "finalized"
+}
+
+# -----------------------------------------------------------------------------
+# Output helpers
+# -----------------------------------------------------------------------------
+_derive_subdomain_or_at() {
+    local domain="$1"
+    # Count dots — apex (one dot, e.g. example.com) → @
+    # Subdomain (two+ dots, e.g. blog.example.com) → first label.
+    local dots
+    dots="$(awk -F. '{print NF-1}' <<<"$domain")"
+    if (( dots <= 1 )); then
+        printf '@'
+    else
+        printf '%s' "${domain%%.*}"
+    fi
+}
+
+_detect_vm_ip() {
+    local ip
+    ip="$(curl -s --connect-timeout 3 --max-time 5 ifconfig.me 2>/dev/null || true)"
+    if [[ -n "$ip" && "$ip" =~ ^[0-9.]+$ ]]; then
+        printf '%s' "$ip"
+    else
+        printf '<your-VM-public-IP>'
+    fi
+}
+
+_print_summary_human() {
+    local subdomain vm_ip caddy_block dns_block
+    subdomain="$(_derive_subdomain_or_at "$DOMAIN")"
+    vm_ip="$(_detect_vm_ip)"
+
+    caddy_block="$(_render_template \
+        "$(dirname "$SCRIPT_DIR")/templates/caddy-block.tmpl" \
+        domain "$DOMAIN" slug "$SLUG" port "$PORT")"
+
+    dns_block="$(_render_template \
+        "$(dirname "$SCRIPT_DIR")/templates/cloudflare-dns.tmpl" \
+        domain "$DOMAIN" subdomain_or_at "$subdomain" vm_public_ip "$vm_ip")"
+
+    cat <<EOF
+${GREEN}✓ Site created: https://${DOMAIN}${RESET}
+
+Admin URL:      https://${DOMAIN}/wp-admin/
+Admin user:     ${WP_ADMIN_USER}
+Admin password: ${WP_ADMIN_PASSWORD}
+Admin email:    ${ADMIN_EMAIL}
+
+Saved to: ${SECRETS_FILE} (mode 600 — re-read with \`wp-list --secrets ${SLUG}\`)
+
+${dns_block}
+
+── Caddy block ──
+${caddy_block}
+
+── Cloudflare Cache Rule ──
+See templates/cloudflare-cache-rule.md (one-time per zone).
+Required cookies to bypass: wordpress_logged_in_*, wp-postpass_*, comment_author_*
+
+── Next ──
+1. Add the DNS row above in Cloudflare dashboard.
+2. Paste the Caddy block into your Caddyfile and \`caddy reload\`.
+3. Apply the Cloudflare Cache Rule (one-time, see referenced doc).
+4. Validate: curl -sI https://${DOMAIN}/ | grep -i cf-cache-status  → expect HIT after 2nd request.
+5. Optional: install Super Page Cache for Cloudflare plugin via
+     wp-exec ${SLUG} plugin install super-page-cache-for-cloudflare --activate
+EOF
+}
+
+_print_summary_json() {
+    local subdomain vm_ip caddy_block dns_block
+    subdomain="$(_derive_subdomain_or_at "$DOMAIN")"
+    vm_ip="$(_detect_vm_ip)"
+    caddy_block="$(_render_template \
+        "$(dirname "$SCRIPT_DIR")/templates/caddy-block.tmpl" \
+        domain "$DOMAIN" slug "$SLUG" port "$PORT")"
+    dns_block="$(_render_template \
+        "$(dirname "$SCRIPT_DIR")/templates/cloudflare-dns.tmpl" \
+        domain "$DOMAIN" subdomain_or_at "$subdomain" vm_public_ip "$vm_ip")"
+
+    jq -n \
+        --arg status "created" \
+        --arg domain "$DOMAIN" \
+        --arg slug "$SLUG" \
+        --argjson port "$PORT" \
+        --argjson redis_db "$REDIS_DB" \
+        --arg admin_user "$WP_ADMIN_USER" \
+        --arg admin_password "$WP_ADMIN_PASSWORD" \
+        --arg admin_email "$ADMIN_EMAIL" \
+        --arg secrets_file "$SECRETS_FILE" \
+        --arg caddy_block "$caddy_block" \
+        --arg cloudflare_dns "$dns_block" \
+        '{status: $status, domain: $domain, slug: $slug, port: $port,
+          redis_db: $redis_db, admin_user: $admin_user,
+          admin_password: $admin_password, admin_email: $admin_email,
+          secrets_file: $secrets_file, caddy_block: $caddy_block,
+          cloudflare_dns: $cloudflare_dns}'
+}
+
+# -----------------------------------------------------------------------------
+# Dry-run — compute slug + planned port/redis_db without persisting.
+# -----------------------------------------------------------------------------
+_dry_run() {
+    SLUG="$(_sanitize_slug "$DOMAIN")" || _die "could not derive slug from '$DOMAIN'"
+    [[ -z "$ADMIN_EMAIL" ]] && ADMIN_EMAIL="admin@${DOMAIN}"
+
+    # Best-effort port / redis_db preview (read-only).
+    local planned_port="<unallocated>" planned_rdb="<unallocated>"
+    if [[ -f "$STATE_FILE" ]]; then
+        # Don't take the lock — purely advisory preview.
+        planned_port="$(_alloc_port 2>/dev/null || echo '<would-allocate>')"
+        planned_rdb="$(_alloc_redis_db 2>/dev/null || echo '<would-allocate>')"
+    fi
+
+    if (( JSON_MODE == 1 )); then
+        jq -n \
+            --arg status "dry-run" \
+            --arg domain "$DOMAIN" \
+            --arg slug "$SLUG" \
+            --arg admin_email "$ADMIN_EMAIL" \
+            --arg port "$planned_port" \
+            --arg redis_db "$planned_rdb" \
+            --arg secrets_file "${SECRETS_DIR}/${SLUG}.env" \
+            '{status: $status, domain: $domain, slug: $slug,
+              admin_email: $admin_email, planned_port: $port,
+              planned_redis_db: $redis_db, planned_secrets_file: $secrets_file}'
+    else
+        cat <<EOF
+${YELLOW}[dry-run]${RESET} would provision:
+  domain:       $DOMAIN
+  slug:         $SLUG
+  admin_email:  $ADMIN_EMAIL
+  port:         $planned_port  (range: ${PORT_RANGE_START}-${PORT_RANGE_END})
+  redis_db:     $planned_rdb  (range: ${REDIS_DB_RANGE_START}-${REDIS_DB_RANGE_END})
+  secrets_file: ${SECRETS_DIR}/${SLUG}.env (mode 600)
+  compose_file: ${SITES_DIR}/${SLUG}/compose.yaml
+  db_name/user: wp_${SLUG}
+No host state was modified.
+EOF
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+main() {
+    _parse_args "$@"
+    _preflight
+
+    if (( DRY_RUN == 1 )); then
+        _dry_run
+        exit 0
+    fi
+
+    _derive_slug_and_guard
+
+    # Allocate (under flock) — skipped if --resume and PORT/REDIS_DB already set.
+    if [[ -z "$PORT" || -z "$REDIS_DB" ]]; then
+        _with_lock _allocate_resources
+        # Re-load CURRENT_STATE/PORT/REDIS_DB after lock release.
+        local entry
+        entry="$(_get_site "$SLUG")"
+        PORT="$(printf '%s' "$entry" | jq -r '.port')"
+        REDIS_DB="$(printf '%s' "$entry" | jq -r '.redis_db')"
+        CURRENT_STATE="$(printf '%s' "$entry" | jq -r '.state')"
+    fi
+
+    # Arm rollback NOW — entry is in sites.json, mutations begin.
+    trap '_rollback $?' ERR
+    ROLLBACK_ARMED=1
+
+    _generate_secrets
+
+    _step_create_db          # → db_created
+    _step_create_dirs        # → dirs_created
+    _step_boot_container     # → container_booted
+    _step_wp_install         # → wp_installed
+    _step_finalize_wp        # → finalized
+
+    # Successful completion — disarm rollback.
+    trap - ERR
+    ROLLBACK_ARMED=0
+
+    if (( JSON_MODE == 1 )); then
+        _print_summary_json
+    else
+        _print_summary_human
+    fi
+}
+
+main "$@"
