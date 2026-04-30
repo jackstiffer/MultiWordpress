@@ -1,0 +1,15 @@
+# MultiWordpress dashboard sudoers — managed file, do not edit.
+#
+# Installed by host/install-dashboard.sh as /etc/sudoers.d/wp-dashboard (mode 440).
+# Validated with `visudo -cf` before activation.
+#
+# Boundary (DASH-02):
+#   - Only the seven CLI verbs below are accessible to the dashboard.
+#   - NO docker socket mount in the dashboard container — sudoers is the only
+#     bridge from the dashboard to the host.
+#   - The dashboard process runs as user `wpdash` (UID/GID 1500).
+#   - Every argument the dashboard passes is regex-validated AND
+#     escapeshellarg()-quoted in PHP before invocation.
+#
+Defaults:wpdash !requiretty
+wpdash ALL=(root) NOPASSWD: /opt/wp/bin/wp-create, /opt/wp/bin/wp-delete, /opt/wp/bin/wp-pause, /opt/wp/bin/wp-resume, /opt/wp/bin/wp-list, /opt/wp/bin/wp-stats, /opt/wp/bin/wp-logs

@@ -1,0 +1,48 @@
+# =============================================================================
+# dashboard/compose.yaml — wp-dashboard service
+# =============================================================================
+#
+# Boundary:
+#   - Loopback-only port (HARD-01 inheritance): 127.0.0.1:18900:80.
+#   - Memory cap 64 MB (it's a polling viewer, not a workload).
+#   - Logging: json-file 10 MB x 3 (Phase 1 / AudioStoryV2 convention).
+#   - NO /var/run/docker.sock mount. The dashboard reaches Docker only by
+#     shelling out to /opt/wp/bin/wp-* via the sudoers whitelist installed
+#     by host/install-dashboard.sh.
+#   - State files (sites.json, metrics.json) are mounted READ-ONLY. Writes
+#     happen via the CLI shell-out (which runs as root via sudo).
+#   - Runs as user wpdash (UID 1500) provisioned on the host. The same UID
+#     appears in /etc/sudoers.d/wp-dashboard.
+# =============================================================================
+
+services:
+  wp-dashboard:
+    image: multiwp:dashboard
+    container_name: wp-dashboard
+    restart: unless-stopped
+    user: "1500:1500"
+    ports:
+      - "127.0.0.1:18900:80"
+    networks:
+      - wp-network
+    mem_limit: 64m
+    environment:
+      WP_ROOT: /opt/wp
+      DASHBOARD_USER: wpdash
+    volumes:
+      # Read-only state mounts. Writes happen via sudoers shell-out, not here.
+      - /opt/wp/state/sites.json:/opt/wp/state/sites.json:ro
+      - /opt/wp/state/metrics.json:/opt/wp/state/metrics.json:ro
+      # CLI verbs are reachable from the container via sudo on the host's PATH.
+      # We mount /opt/wp/bin read-only so the wrapper can stat the verbs for
+      # whitelist validation. Execution still goes through sudo.
+      - /opt/wp/bin:/opt/wp/bin:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  wp-network:
+    external: true
