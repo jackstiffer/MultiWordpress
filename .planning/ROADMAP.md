@@ -28,21 +28,23 @@
 ### Phase 2: CLI Core + First Site E2E
 **Goal**: A complete CLI provisions, lists, and tears down sites; the first real domain is live through the CLI and the Cloudflare + Super Page Cache strategy delivers near-static-file TTFB for logged-out reads.
 **Depends on**: Phase 1
-**Requirements**: CLI-01, CLI-02, CLI-03, CLI-04, CLI-05, CLI-06, CLI-08, CLI-09, CLI-10, CLI-11, CLI-14, STATE-01, STATE-02, STATE-03, STATE-04, PERF-01, PERF-02, HARD-02
+**Requirements**: CLI-01, CLI-02, CLI-03, CLI-04, CLI-05, CLI-06, CLI-08, CLI-09, CLI-10, CLI-11, CLI-14, CLI-15, CLI-16, CLI-17, STATE-01, STATE-02, STATE-03, STATE-04, PERF-01, PERF-02, HARD-02
 **Success Criteria** (what must be TRUE):
   1. Operator runs `wp-create blog.example.com`, pastes the printed Caddy block + Cloudflare DNS rows, and reaches a working WordPress admin at the printed URL — admin username is `admin_<8hex>`, XML-RPC is disabled, `redis-cache` plugin is active with per-site `WP_REDIS_DATABASE` + `WP_REDIS_PREFIX`, and creds persist to `/opt/wp/secrets/<slug>.env` (mode 600).
   2. `wp-create` is robust: re-running with the same slug errors cleanly (no silent overwrite); `--resume <slug>` continues from the last completed state-machine step; any mid-flow failure rolls back DB + dirs + container via `trap ERR`; port (18000+) and redis-DB allocation are serialized via lockfile; `SHOW GRANTS` confirms the DB user has access only to `wp_<slug>.*`.
-  3. `wp-list` shows all sites with slug/domain/status/port/redis DB and distinguishes `running` vs `paused`; `wp-list --secrets <slug>` re-displays creds without leaking to shell history; `wp-stats` prints host CPU/mem/disk plus per-container stats for every `wp-*`; `wp-logs <site> [--follow]` and `wp-exec <site> <wp-cli-args>` work; `wp-pause <site>` stops the container (RAM freed, DB + files + secrets intact, registry state = `paused`) and `wp-resume <site>` starts it back; `wp-delete` removes container + DB + user + secrets and prints exact Caddy/Cloudflare cleanup snippets.
-  4. The first real domain proves the cache promise: after the operator pastes the documented Cloudflare Cache Rule (cookie-bypass for `wordpress_logged_in_*` / `wp-postpass_` / `comment_author_`) and activates Super Page Cache for Cloudflare, logged-out homepage requests return `cf-cache-status: HIT` with TTFB under ~100 ms, while logged-in admin requests bypass cache and hit origin.
+  3. `wp-list` shows all sites with slug/domain/status/tier/port/redis DB and distinguishes `running` vs `paused`; `wp-list --secrets <slug>` re-displays creds without leaking to shell history; `wp-stats` prints host CPU/mem/disk plus per-container stats for every `wp-*` including 24h-peak mem%/CPU%/DB-conn and tier-up flags (≥90% yellow, ≥100% red); `wp-logs <site> [--follow]` and `wp-exec <site> <wp-cli-args>` work; `wp-pause <site>` stops the container (RAM freed, DB + files + secrets intact, registry state = `paused`) and `wp-resume <site>` starts it back; `wp-delete` removes container + DB + user + secrets and prints exact Caddy/Cloudflare cleanup snippets.
+  4. Tiering works end-to-end: `wp-create blog --tier=large` provisions with `mem_limit=768m` + `pm.max_children=12` + DB `MAX_USER_CONNECTIONS=40`; `wp-tier blog xl` recreates the container with `mem_limit=1.5g` + `max_children=24` and re-issues the GRANT with `MAX_USER_CONNECTIONS=80`, in under 10s, with DB + files preserved; both refuse changes that would push cluster `mem_limit` total past 4 GB and name the sites to pause/downsize for budget.
+  5. The first real domain proves the cache promise: after the operator pastes the documented Cloudflare Cache Rule (cookie-bypass for `wordpress_logged_in_*` / `wp-postpass_` / `comment_author_`) and activates Super Page Cache for Cloudflare, logged-out homepage requests return `cf-cache-status: HIT` with TTFB under ~100 ms, while logged-in admin requests bypass cache and hit origin.
 **Plans**: TBD
 
 ### Phase 3: Operational Tooling
-**Goal**: Adding the 5th–10th site is painless because cron is staggered and resource usage stays inside the 4 GB / 1 vCPU envelope under real load.
+**Goal**: Adding the 5th–10th site is painless — cron is staggered, per-site usage is observable via the metrics-poll, and resource usage stays inside the 4 GB / 1 vCPU envelope under real load with mixed tiers.
 **Depends on**: Phase 2
-**Requirements**: PERF-03
+**Requirements**: PERF-03, PERF-04
 **Success Criteria** (what must be TRUE):
   1. Every site provisioned in this phase has `DISABLE_WP_CRON=true` in its `wp-config.php`, and `crontab -l` on the host shows one staggered `wp cron event run --due-now` line per site (deterministic offset from slug-hash modulo) — `wp-stats` does not show a synchronized CPU spike at `:00` when 5+ sites are running.
-  2. With 5 real sites running and Cloudflare absorbing logged-out reads, `docker stats` shows the WP cluster sustained under 2 GB resident and under 50% of one vCPU; AudioStoryV2 has not been OOM-killed or restarted.
+  2. `wp-metrics-poll` runs every minute, completes in under 200 ms, samples `docker stats` + per-site MariaDB connection count, and writes a rolling 24h peak per site (mem%, CPU%, DB conn) to `/opt/wp/state/metrics.json`. After 24h+ runtime, `wp-stats` reflects observed peaks; raising load on one site shows that site (and only that site) flagged as ≥ 90% on its tier.
+  3. With 5 real sites running at mixed tiers (e.g., 1 × `large` + 3 × `standard` + 1 × `small`) and Cloudflare absorbing logged-out reads, `docker stats` shows the WP cluster sustained under 2 GB resident and under 50% of one vCPU; AudioStoryV2 has not been OOM-killed or restarted.
 **Plans**: TBD
 
 ### Phase 4: Polish — Dashboard + Docs
@@ -50,7 +52,7 @@
 **Depends on**: Phase 3
 **Requirements**: DASH-01, DASH-02, DASH-03, DOC-01, DOC-02, DOC-03
 **Success Criteria** (what must be TRUE):
-  1. Operator visits the dashboard URL behind host Caddy basic auth and sees a single-page table of every `wp-*` site with status, CPU%, mem%, request count (when available), and a "view logs" modal — refreshed by 5-second polling, no docker socket mounted into the dashboard container.
+  1. Operator visits the dashboard URL behind host Caddy basic auth and sees a single-page table of every `wp-*` site with status, tier, current mem%, 24h-peak mem%, 24h-peak CPU%, 24h-peak DB-connection count, and a "view logs" modal — peaks ≥ 90% color-coded yellow ("tier-up suggested") and ≥ 100% red ("tier-up needed"). Refreshed by 5-second polling, no docker socket mounted into the dashboard container.
   2. Dashboard "add site" and "delete site" buttons shell out to `wp-create` / `wp-delete` via a narrow sudoers whitelist (exact command lines, no shell metachars accepted), and `/var/log/auth.log` records each invocation.
   3. README walks a new operator from zero to a live site (prerequisites, Caddy + Cloudflare assumptions, full lifecycle); a Caddy snippet template + Cloudflare DNS row guide is included; a scaling-cliff doc names the four warning signs that this single-VM design has been outgrown.
 **Plans**: TBD
@@ -67,15 +69,15 @@
 
 ## Coverage
 
-**v1 requirements:** 34 total
-**Mapped:** 34 / 34 ✓
+**v1 requirements:** 38 total
+**Mapped:** 38 / 38 ✓
 **Unmapped:** 0
 
 | Phase | Requirement Count | Requirements |
 |-------|-------------------|--------------|
 | 1. Foundation | 14 | INFRA-01..06, IMG-01..06, HARD-01, HARD-03 |
-| 2. CLI Core + First Site E2E | 17 | CLI-01..06, CLI-08..11, CLI-14, STATE-01..04, PERF-01, PERF-02, HARD-02 |
-| 3. Operational Tooling | 1 | PERF-03 |
+| 2. CLI Core + First Site E2E | 20 | CLI-01..06, CLI-08..11, CLI-14..17, STATE-01..04, PERF-01, PERF-02, HARD-02 |
+| 3. Operational Tooling | 2 | PERF-03, PERF-04 |
 | 4. Polish — Dashboard + Docs | 6 | DASH-01..03, DOC-01..03 |
 
 ## Notes on Phase Shape
