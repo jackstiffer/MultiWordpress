@@ -8,7 +8,7 @@
 
 - [x] **Phase 1: Foundation** — Shared infra (MariaDB + Redis + network) and per-site image template, with day-one pitfalls (MTU, ports, mem limits, log caps, image hardening) closed. ✓ 2026-04-30
 - [x] **Phase 2: CLI Core + First Site E2E** — Full CLI surface (`wp-create`/`wp-delete`/`wp-list`/`wp-stats`/`wp-logs`/`wp-exec`) provisions one real domain end-to-end and validates the Cloudflare + Super Page Cache promise. ✓ 2026-04-30 (static + smoke; live E2E via docs/first-site-e2e.md)
-- [ ] **Phase 3: Operational Tooling** — Cron stagger and the daily-driver hardening needed to run 5+ sites without manual babysitting.
+- [x] **Phase 3: Operational Tooling** — Cron stagger and the daily-driver hardening needed to run 5+ sites without manual babysitting. ✓ 2026-04-30 (static)
 - [ ] **Phase 4: Polish — Dashboard + Docs** — Thin PHP dashboard (read-only stats + sudoers-whitelisted add/delete) and the documentation suite (Caddy/Cloudflare runbook, scaling-cliff doc).
 
 ## Phase Details

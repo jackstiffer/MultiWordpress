@@ -1,0 +1,343 @@
+#!/usr/bin/env bash
+# =============================================================================
+# bin/wp-metrics-poll — sample cluster + per-site stats every minute.
+# =============================================================================
+#
+# Invoked once per minute by /etc/cron.d/multiwordpress (installed via
+# host/install-metrics-cron.sh). Target completion < 200 ms.
+#
+# Sequence:
+#   1. flock so concurrent invocations don't corrupt metrics.json.
+#   2. Read /opt/wp/state/metrics.json (init skeleton if missing).
+#   3. Sample cluster pool: cat /sys/fs/cgroup/wp.slice/memory.current.
+#   4. Sample per-site: enumerate `wp-<slug>` containers (skip wp-mariadb
+#      and wp-redis), `docker stats <name> --no-stream` → MEM bytes + CPU %.
+#   5. Sample DB conns per site: one `_db_exec` SELECT against
+#      information_schema.processlist GROUP BY user.
+#   6. Append a sample to each site's rolling 24h buffer (1440 max).
+#   7. Re-compute peaks (max over the 24h window).
+#   8. Atomic write via temp + mv. Mode 644.
+#   9. 5 MB sanity guard — trim to last 1440 samples per site if exceeded.
+#  10. Always exit 0 (cron must not fail).
+#
+# Schema (locked — Phase 4 dashboard reads this):
+#   {
+#     "version": 1,
+#     "cluster": { pool_used_bytes, pool_used_peak_bytes,
+#                  peak_window_start, peak_window_end },
+#     "sites": {
+#       "<slug>": { mem_bytes, mem_peak_bytes, cpu_pct, cpu_peak_pct,
+#                   db_conn, db_conn_peak, last_sample_ts,
+#                   samples: [ {ts, mem, cpu, db_conn}, ... ≤ 1440 ] }
+#     }
+#   }
+#
+# Requirements: PERF-04
+# Plan: .planning/phases/03-operational-tooling/03-CONTEXT.md
+# =============================================================================
+
+# Don't `set -e` — we always want to exit 0 from cron. Trap individual failures.
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=_lib.sh
+# Source _lib.sh in READ_ONLY mode so it doesn't enforce root for state I/O
+# helpers (we still need root to read cgroup files; cron runs as root anyway).
+READ_ONLY=1
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/_lib.sh"
+
+LOCK_FILE_POLL="/var/lock/multiwordpress-metrics-poll.lock"
+MAX_SAMPLES=1440          # 24h × 60min
+MAX_FILE_BYTES=$((5 * 1024 * 1024))   # 5 MB sanity guard
+PEAK_WINDOW_SEC=$((24 * 60 * 60))     # 24h
+
+# -----------------------------------------------------------------------------
+# Skeleton + bootstrap
+# -----------------------------------------------------------------------------
+_metrics_skeleton() {
+    printf '%s' '{"version":1,"cluster":{"pool_used_bytes":0,"pool_used_peak_bytes":0,"peak_window_start":null,"peak_window_end":null},"sites":{}}'
+}
+
+_init_metrics_file() {
+    [[ -d "$STATE_DIR" ]] || mkdir -p "$STATE_DIR" 2>/dev/null || return 1
+    if [[ ! -f "$METRICS_FILE" ]]; then
+        local tmp="${METRICS_FILE}.tmp.$$"
+        _metrics_skeleton > "$tmp" 2>/dev/null || return 1
+        chmod 644 "$tmp" 2>/dev/null || true
+        mv "$tmp" "$METRICS_FILE" 2>/dev/null || return 1
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Cluster sample — read /sys/fs/cgroup/wp.slice/memory.current
+# -----------------------------------------------------------------------------
+_sample_cluster_bytes() {
+    local val
+    if [[ -r /sys/fs/cgroup/wp.slice/memory.current ]]; then
+        val="$(cat /sys/fs/cgroup/wp.slice/memory.current 2>/dev/null || echo 0)"
+    else
+        val=0
+    fi
+    [[ "$val" =~ ^[0-9]+$ ]] || val=0
+    printf '%s' "$val"
+}
+
+# -----------------------------------------------------------------------------
+# Per-site container list — names like wp-<slug>, excluding wp-mariadb/wp-redis.
+# -----------------------------------------------------------------------------
+_list_site_containers() {
+    docker ps --filter 'name=wp-' --format '{{.Names}}' 2>/dev/null \
+        | grep -E '^wp-' \
+        | grep -vE '^(wp-mariadb|wp-redis)$' \
+        || true
+}
+
+# -----------------------------------------------------------------------------
+# Parse `docker stats <name> --no-stream --format '{{.MemUsage}} {{.CPUPerc}}'`.
+# Output: <mem_bytes> <cpu_pct>
+# Examples of MemUsage: "123.4MiB / 4GiB", "1.2GiB / 4GiB", "456KiB / 4GiB".
+# -----------------------------------------------------------------------------
+_parse_docker_stats() {
+    local raw="$1"
+    # raw looks like: "123.4MiB / 4GiB 12.34%"
+    # Strip the "/ <limit>" and the trailing % from CPU.
+    local mem_part cpu_part num unit
+    mem_part="$(awk '{print $1}' <<<"$raw")"
+    cpu_part="$(awk '{print $NF}' <<<"$raw" | tr -d '%')"
+
+    # Split mem_part into number + unit.
+    num="$(printf '%s' "$mem_part" | sed -E 's/([0-9.]+).*/\1/')"
+    unit="$(printf '%s' "$mem_part" | sed -E 's/[0-9.]+(.*)/\1/')"
+
+    [[ -n "$num"     ]] || num=0
+    [[ -n "$cpu_part" ]] || cpu_part=0
+
+    # Convert num+unit → bytes via awk (handles floats; bash can't).
+    local bytes
+    bytes="$(awk -v n="$num" -v u="$unit" 'BEGIN{
+        u = toupper(u);
+        mult = 1;
+        if      (u ~ /^KIB/) mult = 1024;
+        else if (u ~ /^MIB/) mult = 1024*1024;
+        else if (u ~ /^GIB/) mult = 1024*1024*1024;
+        else if (u ~ /^TIB/) mult = 1024*1024*1024*1024;
+        else if (u ~ /^KB/)  mult = 1000;
+        else if (u ~ /^MB/)  mult = 1000*1000;
+        else if (u ~ /^GB/)  mult = 1000*1000*1000;
+        else if (u ~ /^B/)   mult = 1;
+        printf "%d", n * mult;
+    }')"
+    [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
+
+    printf '%s %s' "$bytes" "$cpu_part"
+}
+
+_sample_site_stats() {
+    local container="$1"
+    local raw
+    raw="$(docker stats "$container" --no-stream --format '{{.MemUsage}} {{.CPUPerc}}' 2>/dev/null || true)"
+    if [[ -z "$raw" ]]; then
+        printf '0 0'
+        return 0
+    fi
+    _parse_docker_stats "$raw"
+}
+
+# -----------------------------------------------------------------------------
+# DB connections — one query, parse rows.
+# Output (stdout): JSON object {"<slug>": <count>, ...}
+# Returns empty {} on any failure.
+# -----------------------------------------------------------------------------
+_sample_db_conns() {
+    local raw rows
+    raw="$(_db_exec "SELECT user, COUNT(*) AS c FROM information_schema.processlist WHERE user LIKE 'wp_%' GROUP BY user;" 2>/dev/null || true)"
+    if [[ -z "$raw" ]]; then
+        printf '{}'
+        return 0
+    fi
+    # Skip header row ("user\tc"); convert "wp_<slug>\t<count>" → JSON.
+    rows="$(printf '%s\n' "$raw" \
+        | awk 'NR>1 && $1 ~ /^wp_/ { sub(/^wp_/,"",$1); printf "%s\t%s\n", $1, $2 }')"
+    if [[ -z "$rows" ]]; then
+        printf '{}'
+        return 0
+    fi
+    printf '%s\n' "$rows" \
+        | jq -R -s 'split("\n") | map(select(length > 0) | split("\t")) | map({(.[0]): (.[1] | tonumber)}) | add // {}' \
+        2>/dev/null \
+        || printf '{}'
+}
+
+# -----------------------------------------------------------------------------
+# Atomic write of metrics.json.
+# -----------------------------------------------------------------------------
+_save_metrics() {
+    local json="$1"
+    local tmp="${METRICS_FILE}.tmp.$$"
+    if ! printf '%s' "$json" | jq -e . >/dev/null 2>&1; then
+        _log warn "wp-metrics-poll: refusing to write invalid JSON"
+        return 1
+    fi
+    printf '%s\n' "$json" > "$tmp" 2>/dev/null || return 1
+    chmod 644 "$tmp" 2>/dev/null || true
+    mv "$tmp" "$METRICS_FILE" 2>/dev/null || { rm -f "$tmp"; return 1; }
+}
+
+# -----------------------------------------------------------------------------
+# 5 MB sanity guard — if metrics.json grows beyond MAX_FILE_BYTES, trim each
+# site's samples[] to the most recent MAX_SAMPLES entries. Always idempotent.
+# -----------------------------------------------------------------------------
+_sanity_trim() {
+    local current_size
+    current_size="$(wc -c <"$METRICS_FILE" 2>/dev/null || echo 0)"
+    if (( current_size > MAX_FILE_BYTES )); then
+        _log warn "wp-metrics-poll: metrics.json size ${current_size} > ${MAX_FILE_BYTES}; trimming samples"
+        local trimmed
+        trimmed="$(jq --argjson n "$MAX_SAMPLES" '
+            .sites |= with_entries(.value.samples =
+                (.value.samples // [])
+                | (if length > $n then .[length - $n:] else . end)
+            )
+        ' "$METRICS_FILE" 2>/dev/null)" || return 0
+        [[ -n "$trimmed" ]] && _save_metrics "$trimmed" || true
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Main poll — runs under flock.
+# -----------------------------------------------------------------------------
+_run_poll() {
+    _init_metrics_file || { _log warn "wp-metrics-poll: cannot init $METRICS_FILE"; return 0; }
+
+    local now_iso now_epoch window_cutoff_iso
+    now_iso="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    now_epoch="$(date +%s)"
+    window_cutoff_iso="$(date -u -d "@$((now_epoch - PEAK_WINDOW_SEC))" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null \
+        || date -u -r "$((now_epoch - PEAK_WINDOW_SEC))" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null \
+        || echo "1970-01-01T00:00:00Z")"
+
+    local cluster_bytes
+    cluster_bytes="$(_sample_cluster_bytes)"
+
+    # DB conns map (one query for all sites).
+    local db_conns_json
+    db_conns_json="$(_sample_db_conns)"
+    [[ -n "$db_conns_json" ]] || db_conns_json='{}'
+
+    # Build per-site sample object: {<slug>: {mem, cpu, db_conn}, ...}
+    local containers site_samples='{}'
+    containers="$(_list_site_containers)"
+    if [[ -n "$containers" ]]; then
+        local container slug stats mem cpu dbc
+        while IFS= read -r container; do
+            [[ -z "$container" ]] && continue
+            slug="${container#wp-}"
+            stats="$(_sample_site_stats "$container")"
+            mem="$(awk '{print $1}' <<<"$stats")"
+            cpu="$(awk '{print $2}' <<<"$stats")"
+            [[ "$mem" =~ ^[0-9]+$ ]] || mem=0
+            # cpu may be float — keep as-is, default 0
+            [[ -n "$cpu" ]] || cpu=0
+            dbc="$(printf '%s' "$db_conns_json" | jq -r --arg s "$slug" '.[$s] // 0' 2>/dev/null)"
+            [[ "$dbc" =~ ^[0-9]+$ ]] || dbc=0
+            site_samples="$(printf '%s' "$site_samples" | jq \
+                --arg s "$slug" \
+                --argjson mem "$mem" \
+                --argjson cpu "$cpu" \
+                --argjson dbc "$dbc" \
+                '.[$s] = {mem: $mem, cpu: $cpu, db_conn: $dbc}' 2>/dev/null)" || site_samples='{}'
+        done <<<"$containers"
+    fi
+
+    # Read existing metrics, merge new sample, recompute peaks, prune old samples.
+    local existing
+    existing="$(cat "$METRICS_FILE" 2>/dev/null || _metrics_skeleton)"
+    if ! printf '%s' "$existing" | jq -e . >/dev/null 2>&1; then
+        existing="$(_metrics_skeleton)"
+    fi
+
+    local updated
+    updated="$(printf '%s' "$existing" | jq \
+        --arg now "$now_iso" \
+        --arg cutoff "$window_cutoff_iso" \
+        --argjson cluster "$cluster_bytes" \
+        --argjson site_samples "$site_samples" \
+        --argjson max_n "$MAX_SAMPLES" \
+        '
+        # ---- Cluster ----
+        .version = 1
+        | .cluster.pool_used_bytes = $cluster
+        | .cluster.pool_used_peak_bytes =
+            ([(.cluster.pool_used_peak_bytes // 0), $cluster] | max)
+        | .cluster.peak_window_start = (
+            if (.cluster.peak_window_start // null) == null
+            then $now else .cluster.peak_window_start end)
+        | .cluster.peak_window_end = $now
+
+        # ---- Sites: fold in fresh per-site samples ----
+        | .sites = (
+            (.sites // {}) as $old
+            | reduce ($site_samples | to_entries[]) as $e (
+                $old;
+                .[$e.key] = (
+                    (.[$e.key] // {samples: []}) as $cur
+                    | $cur
+                    | .samples = (
+                        ((.samples // []) + [{
+                            ts: $now,
+                            mem: $e.value.mem,
+                            cpu: $e.value.cpu,
+                            db_conn: $e.value.db_conn
+                        }])
+                        # Drop samples older than 24h
+                        | map(select(.ts >= $cutoff))
+                        # Hard-cap to MAX_SAMPLES (most recent)
+                        | (if length > $max_n then .[length - $max_n:] else . end)
+                    )
+                    | .mem_bytes      = $e.value.mem
+                    | .cpu_pct        = $e.value.cpu
+                    | .db_conn        = $e.value.db_conn
+                    | .last_sample_ts = $now
+                    | .mem_peak_bytes = ([.samples[].mem]               | max // 0)
+                    | .cpu_peak_pct   = ([.samples[].cpu]               | max // 0)
+                    | .db_conn_peak   = ([.samples[].db_conn]           | max // 0)
+                )
+            )
+        )
+        ' 2>/dev/null)" || updated=""
+
+    if [[ -n "$updated" ]]; then
+        _save_metrics "$updated" || _log warn "wp-metrics-poll: save failed"
+    else
+        _log warn "wp-metrics-poll: jq merge failed; preserving prior metrics.json"
+    fi
+
+    _sanity_trim
+}
+
+# -----------------------------------------------------------------------------
+# Entry point — flock guard, then run. Always exit 0.
+# -----------------------------------------------------------------------------
+main() {
+    # Ensure lock file exists in /var/lock (root-writable on Debian/Ubuntu).
+    if [[ ! -e "$LOCK_FILE_POLL" ]]; then
+        : > "$LOCK_FILE_POLL" 2>/dev/null || true
+        chmod 644 "$LOCK_FILE_POLL" 2>/dev/null || true
+    fi
+
+    # Non-blocking flock — if a prior poll is still running (slow VM), skip
+    # rather than queue. Each invocation must be quick.
+    (
+        exec 201>"$LOCK_FILE_POLL" 2>/dev/null || exit 0
+        if ! flock -n 201; then
+            _log warn "wp-metrics-poll: prior invocation still running; skipping"
+            exit 0
+        fi
+        _run_poll
+    ) || true
+
+    exit 0
+}
+
+main "$@"

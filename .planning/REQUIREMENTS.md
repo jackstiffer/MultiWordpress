@@ -64,8 +64,8 @@ All WordPress containers share a single 4 GB memory pool enforced at the host cg
 
 - [ ] **PERF-01**: `redis-cache` plugin (Till Krüss) baked into provisioning; activated automatically with `WP_REDIS_DATABASE` (per-site index) AND `WP_REDIS_PREFIX` (slug) set in `wp-config.php`.
 - [ ] **PERF-02**: Page-cache strategy documented: Cloudflare Cache Rules + Super Page Cache for Cloudflare plugin. CLI prints the cookie-bypass rule the user must paste into Cloudflare.
-- [ ] **PERF-03**: `DISABLE_WP_CRON=true` in every site's `wp-config.php`; provisioning script registers a host crontab line per site with a deterministic offset (slug-hash mod) to stagger wp-cron runs.
-- [ ] **PERF-04**: Host cron `wp-metrics-poll` runs every minute, samples `docker stats --no-stream` JSON + per-site MariaDB connection count + `wp.slice` cgroup current memory (`cat /sys/fs/cgroup/wp.slice/memory.current`), and writes rolling 24h peaks to `/opt/wp/state/metrics.json`: (a) cluster `pool_used_peak_bytes`; (b) per-site `mem_peak_bytes`, `cpu_peak_pct`, `db_conn_peak`. Drops samples older than 24h on each write. Sample run completes in < 200 ms.
+- [x] **PERF-03**: `DISABLE_WP_CRON=true` in every site's `wp-config.php`; provisioning script registers a host crontab line per site with a deterministic offset (slug-hash mod) to stagger wp-cron runs.
+- [x] **PERF-04**: Host cron `wp-metrics-poll` runs every minute, samples `docker stats --no-stream` JSON + per-site MariaDB connection count + `wp.slice` cgroup current memory (`cat /sys/fs/cgroup/wp.slice/memory.current`), and writes rolling 24h peaks to `/opt/wp/state/metrics.json`: (a) cluster `pool_used_peak_bytes`; (b) per-site `mem_peak_bytes`, `cpu_peak_pct`, `db_conn_peak`. Drops samples older than 24h on each write. Sample run completes in < 200 ms.
 
 ### Coexistence / Hardening
 
@@ -162,8 +162,8 @@ Deferred. Tracked, not in current roadmap.
 | STATE-04 | Phase 2 | Pending |
 | PERF-01 | Phase 2 | Pending |
 | PERF-02 | Phase 2 | Pending |
-| PERF-03 | Phase 3 | Pending |
-| PERF-04 | Phase 3 | Pending |
+| PERF-03 | Phase 3 | Complete (static) |
+| PERF-04 | Phase 3 | Complete (static) |
 | HARD-01 | Phase 1 | Pending |
 | HARD-02 | Phase 2 | Pending |
 | HARD-03 | Phase 1 | Pending |

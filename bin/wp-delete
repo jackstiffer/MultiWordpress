@@ -111,6 +111,17 @@ else
     _log warn "compose file not found at $COMPOSE_FILE (skipping compose down)"
 fi
 
+# 1b. Remove host wp-cron stagger (PERF-03) — before DB drop so failure here
+#     doesn't leave a cron line targeting a non-existent container after delete
+#     completes.
+_log info "Removing wp-cron stagger"
+# shellcheck source=_cron-mgr.sh
+if source "$(dirname "$0")/_cron-mgr.sh" 2>/dev/null; then
+    _cron_unregister "$SLUG" || _log warn "Cron unregister failed (non-fatal)"
+else
+    _log warn "_cron-mgr.sh not found; skipping wp-cron stagger removal"
+fi
+
 # 2. Drop DB + user (uses _db_drop_site helper)
 if ! _db_drop_site "$SLUG"; then
     DB_DROP_FAILED=1

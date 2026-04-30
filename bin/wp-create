@@ -581,6 +581,18 @@ _step_finalize_wp() {
 
     # 14. mark finalized
     _advance_state "finalized"
+
+    # 15. Register host wp-cron stagger line (PERF-03).
+    #     Best-effort: if the cron file is unwritable we warn but do not fail
+    #     the provisioning — the site itself is fully functional, the operator
+    #     just needs to run host/install-metrics-cron.sh later.
+    _log info "Registering wp-cron stagger"
+    # shellcheck source=_cron-mgr.sh
+    if source "$SCRIPT_DIR/_cron-mgr.sh" 2>/dev/null; then
+        _cron_register "$SLUG" || _log warn "wp-cron stagger registration failed (non-fatal; run host/install-metrics-cron.sh)"
+    else
+        _log warn "_cron-mgr.sh not found; skipping wp-cron stagger registration"
+    fi
 }
 
 # -----------------------------------------------------------------------------
