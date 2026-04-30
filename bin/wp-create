@@ -532,19 +532,19 @@ _step_wp_install() {
 }
 
 # -----------------------------------------------------------------------------
-# Steps 12 + 13 — redis-cache plugin, wp-config-extras injection.
+# Steps 12 + 13 — wp-config-extras injection FIRST (so redis-cache sees
+# WP_REDIS_HOST=wp-redis), then redis-cache plugin install + enable.
+#
+# Order matters: `wp redis enable` runs an immediate Predis connection test.
+# If WP_REDIS_HOST isn't yet defined as a wp-config constant, the plugin
+# falls back to its default (127.0.0.1) and the connection is refused
+# because Redis isn't on the WP container's loopback — it's on wp-redis
+# in the docker network.
 # -----------------------------------------------------------------------------
 _step_finalize_wp() {
     _should_run_state "finalized" || { _log info "skip steps 12-14 (already finalized)"; return 0; }
 
-    # 12. redis-cache plugin
-    _wp_exec "$SLUG" plugin install redis-cache --activate \
-        || _die "wp plugin install redis-cache failed"
-    _wp_exec "$SLUG" redis enable \
-        || _die "wp redis enable failed"
-    _log info "redis-cache enabled"
-
-    # 13. wp-config-extras injection.
+    # 12. wp-config-extras injection (must happen BEFORE redis-cache enable).
     local tmpl="${SCRIPT_DIR}/../templates/wp-config-extras.php.tmpl"
     [[ -f "$tmpl" ]] || tmpl="$(dirname "$SCRIPT_DIR")/templates/wp-config-extras.php.tmpl"
     [[ -f "$tmpl" ]] || _die "wp-config-extras.php.tmpl not found"
@@ -570,14 +570,22 @@ _step_finalize_wp() {
         fi
     ' || _die "wp-config.php require_once injection failed"
 
-    # Verify DISABLE_WP_CRON took effect.
+    # Verify DISABLE_WP_CRON + WP_REDIS_HOST took effect.
     local verify
-    verify="$(_wp_exec "$SLUG" eval 'echo (defined("DISABLE_WP_CRON") && DISABLE_WP_CRON) ? "ok" : "fail";' 2>/dev/null || true)"
+    verify="$(_wp_exec "$SLUG" eval 'echo (defined("DISABLE_WP_CRON") && DISABLE_WP_CRON && defined("WP_REDIS_HOST") && WP_REDIS_HOST === "wp-redis") ? "ok" : "fail";' 2>/dev/null || true)"
     if [[ "$verify" != *ok* ]]; then
-        _log warn "wp-config-extras verify: DISABLE_WP_CRON not active (got: $verify)"
+        _log warn "wp-config-extras verify: DISABLE_WP_CRON or WP_REDIS_HOST not active (got: $verify)"
     else
-        _log info "wp-config-extras verified (DISABLE_WP_CRON active)"
+        _log info "wp-config-extras verified (DISABLE_WP_CRON + WP_REDIS_HOST=wp-redis active)"
     fi
+
+    # 13. redis-cache plugin — now the plugin's connection test will reach
+    # wp-redis instead of 127.0.0.1.
+    _wp_exec "$SLUG" plugin install redis-cache --activate \
+        || _die "wp plugin install redis-cache failed"
+    _wp_exec "$SLUG" redis enable \
+        || _die "wp redis enable failed"
+    _log info "redis-cache enabled"
 
     # 14. mark finalized
     _advance_state "finalized"
