@@ -13,7 +13,7 @@ Lightweight, multi-site WordPress hosting for a single GCP VM that already runs 
 
 ## Operating in Production
 
-- **First-time deployment from zero (recommended)**: [docs/deploy.md](docs/deploy.md) — full from-zero guide including GCP VM creation, Docker install, Caddy install, and first site through to `cf-cache-status: HIT`. ~30 minutes.
+- **First-time deployment from zero (recommended)**: [docs/deploy.md](docs/deploy.md) — fresh GCP VM to first site live. The whole install is automated by `sudo bash host/setup.sh` — detects what's installed, asks before each step, only does what's missing. ~30 minutes.
 - **Provision your first site (if VM already set up)**: [docs/first-site-e2e.md](docs/first-site-e2e.md) — 8-step validation runbook.
 - **Day-to-day operations**: [docs/cli.md](docs/cli.md) — full CLI reference.
 - **Cron + metrics**: [docs/operational.md](docs/operational.md) — install + verify the metrics-poll cron.
