@@ -24,7 +24,11 @@
   4. `docker run` of the per-site image runs as UID 33 (`www-data`); `WP_DEBUG_LOG` and php-fpm `error_log` both stream to `/proc/self/fd/2` so internal logs inherit the docker driver's rotation.
   5. Host has cgroup v2 (`stat -fc %T /sys/fs/cgroup/` returns `cgroup2fs`); systemd unit `/etc/systemd/system/wp.slice` is installed with `MemoryMax=4G` and `CPUWeight=100`; `systemctl status wp.slice` shows it loaded; `cat /sys/fs/cgroup/wp.slice/memory.max` returns `4294967296`.
   6. AudioStoryV2 stack is unaffected: `docker network ls` shows `wp-network` distinct from `audiostory_app-network`, no port conflicts on 3000/6379, no AudioStoryV2 containers in `wp.slice`, and `docker stats` shows the WP infra cluster well under 1 GB resident at idle.
-**Plans**: TBD
+**Plans**: 4 plans
+- [ ] 01-PLAN-01-shared-infra-compose.md — Shared infra compose (wp-mariadb + wp-redis + wp-network @ MTU 1460, loopback ports, capped logs)
+- [ ] 01-PLAN-02-per-site-image.md — Per-site WP image template (FPM-only, OPcache, ondemand pool, UID 33, log redirection)
+- [ ] 01-PLAN-03-wp-slice-cgroup.md — Host wp.slice systemd unit + cgroup-v2 install script (4 GB cluster cap)
+- [ ] 01-PLAN-04-repo-skeleton.md — .gitignore + root README with Phase-1 setup runbook and validation table
 
 ### Phase 2: CLI Core + First Site E2E
 **Goal**: A complete CLI provisions, lists, and tears down sites; the first real domain is live through the CLI and the Cloudflare + Super Page Cache strategy delivers near-static-file TTFB for logged-out reads.
@@ -63,7 +67,7 @@
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Foundation | 0/0 | Not started | - |
+| 1. Foundation | 0/4 | Planned | - |
 | 2. CLI Core + First Site E2E | 0/0 | Not started | - |
 | 3. Operational Tooling | 0/0 | Not started | - |
 | 4. Polish — Dashboard + Docs | 0/0 | Not started | - |
