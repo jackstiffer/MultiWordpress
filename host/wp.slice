@@ -1,0 +1,13 @@
+[Unit]
+Description=Cluster cgroup for MultiWordpress per-site containers
+Documentation=https://github.com/<repo>/blob/main/host/README.md
+Before=slices.target
+
+[Slice]
+# 4 GB hard cap on combined memory of all wp-<site> containers.
+# Per-site containers MUST run with `--cgroup-parent=wp.slice` and MUST NOT
+# set their own `mem_limit` / `--memory`. wp-mariadb and wp-redis are NOT
+# in this slice — they have their own caps in compose/compose.yaml.
+MemoryMax=4G
+MemoryHigh=3.5G
+CPUWeight=100
