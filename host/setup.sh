@@ -161,12 +161,29 @@ else
 fi
 
 # Shared infra (containers running)
+INFRA_RUNNING=0
 if docker ps --filter name=wp-mariadb --format '{{.Names}}' 2>/dev/null | grep -q '^wp-mariadb$' \
    && docker ps --filter name=wp-redis --format '{{.Names}}' 2>/dev/null | grep -q '^wp-redis$'; then
     ok "shared infra running (wp-mariadb + wp-redis)"
+    INFRA_RUNNING=1
 else
     miss "shared infra not running"
     NEEDS[infra]=1
+fi
+
+# DB password validation: if infra is running AND we have a real password,
+# verify it actually works. Catches the trap where MariaDB seeded with one
+# password but .env was rotated afterward (yields silent 'Access denied').
+if [ "$INFRA_RUNNING" -eq 1 ] && [ -f "$WP_ROOT/.env" ] && \
+   grep -qE '^MARIADB_ROOT_PASSWORD=[^[:space:]]' "$WP_ROOT/.env" && \
+   ! grep -qE '^MARIADB_ROOT_PASSWORD=replace-with-' "$WP_ROOT/.env"; then
+    ROOT_PW="$(grep ^MARIADB_ROOT_PASSWORD "$WP_ROOT/.env" | cut -d= -f2-)"
+    if docker exec wp-mariadb mariadb -uroot -p"$ROOT_PW" -e "SELECT 1;" >/dev/null 2>&1; then
+        ok "MariaDB root password matches /opt/wp/.env"
+    else
+        miss "MariaDB root password DOES NOT match /opt/wp/.env (volume seeded with stale password)"
+        NEEDS[db_reset]=1
+    fi
 fi
 
 # Per-site image
@@ -194,12 +211,18 @@ else
     DASHBOARD_RUNNING=0
 fi
 
-# Symlinks for sudo PATH
-if [ -L /usr/local/bin/wp-create ]; then
-    ok "CLI symlinks in /usr/local/bin (sudo PATH friendly)"
+# Wrappers for sudo PATH (NOT symlinks — symlinks break BASH_SOURCE-based
+# _lib.sh resolution since dirname of the symlink path is /usr/local/bin)
+if [ -f /usr/local/bin/wp-create ] && \
+   ! [ -L /usr/local/bin/wp-create ] && \
+   grep -q '/opt/wp/bin/wp-create' /usr/local/bin/wp-create 2>/dev/null; then
+    ok "CLI wrappers installed in /usr/local/bin (sudo PATH friendly)"
+elif [ -L /usr/local/bin/wp-create ]; then
+    miss "CLI symlinks present (broken — must be replaced with wrappers)"
+    NEEDS[wrappers]=1
 else
-    miss "CLI symlinks missing in /usr/local/bin"
-    NEEDS[symlinks]=1
+    miss "CLI wrappers missing in /usr/local/bin"
+    NEEDS[wrappers]=1
 fi
 
 # -----------------------------------------------------------------------------
@@ -228,9 +251,10 @@ else
     [ -n "${NEEDS[secrets]:-}" ]      && echo "    • generate /opt/wp/.env (MARIADB_ROOT_PASSWORD)"
     [ -n "${NEEDS[wp_slice]:-}" ]     && echo "    • install host/wp.slice systemd unit (4 GB cap)"
     [ -n "${NEEDS[infra]:-}" ]        && echo "    • bring up shared infra (wp-mariadb + wp-redis)"
+    [ -n "${NEEDS[db_reset]:-}" ]     && echo "    • RESET MariaDB volume (stale password) — wipes any existing site DBs!"
     [ -n "${NEEDS[image]:-}" ]        && echo "    • build per-site image multiwp:wordpress-6-php8.3"
     [ -n "${NEEDS[metrics_cron]:-}" ] && echo "    • install metrics-poll cron"
-    [ -n "${NEEDS[symlinks]:-}" ]     && echo "    • symlink /opt/wp/bin/wp-* into /usr/local/bin/"
+    [ -n "${NEEDS[wrappers]:-}" ]     && echo "    • install wrapper scripts in /usr/local/bin/wp-*"
     echo ""
     if [ "$ASSUME_YES" -eq 0 ]; then
         confirm "Proceed step-by-step?" || { echo "Aborted."; exit 0; }
@@ -309,6 +333,47 @@ if [ -n "${NEEDS[infra]:-}" ]; then
     fi
 fi
 
+if [ -n "${NEEDS[db_reset]:-}" ]; then
+    step_banner "Reset MariaDB volume (stale password)"
+    err "MariaDB's data volume was seeded with a different password than /opt/wp/.env."
+    echo "  Common cause: compose came up before init-secrets.sh ran, OR .env was"
+    echo "  rotated after first boot. The data volume retains the OLD password."
+    echo ""
+    echo "  Resolution: stop infra, delete the wp_mariadb_data volume, restart."
+    echo ""
+    echo "  ${RED}WARNING:${RESET} this PERMANENTLY deletes all per-site DBs."
+    echo "  Safe to do during initial setup (no real sites yet)."
+    if confirm "Nuke wp_mariadb_data volume + restart infra?"; then
+        cd "$REPO_ROOT"
+        docker compose -f compose/compose.yaml down -v
+        docker compose -f compose/compose.yaml up -d
+        echo "  Waiting for healthcheck..."
+        for i in $(seq 1 30); do
+            if docker ps --filter name=wp-mariadb --filter health=healthy --format '{{.Names}}' \
+                | grep -q '^wp-mariadb$'; then
+                ok "MariaDB re-seeded with current /opt/wp/.env password"
+                break
+            fi
+            sleep 1
+            [ "$i" -eq 30 ] && warn "wp-mariadb did not become healthy within 30s"
+        done
+
+        # Also clean up any half-provisioned site state (sites.json + secrets/)
+        if [ -f "$WP_ROOT/state/sites.json" ]; then
+            stale_sites="$(jq -r '.sites | keys | length' "$WP_ROOT/state/sites.json" 2>/dev/null || echo 0)"
+            if [ "${stale_sites:-0}" -gt 0 ]; then
+                warn "sites.json had ${stale_sites} entries from before the reset — clearing"
+                echo '{"version":1,"next_port":18000,"next_redis_db":1,"sites":{}}' \
+                    > "$WP_ROOT/state/sites.json"
+                rm -f "$WP_ROOT/secrets/"*.env 2>/dev/null || true
+                ok "site registry + secrets cleared"
+            fi
+        fi
+    else
+        warn "skipped — wp-create will continue to fail with 'Access denied' until resolved"
+    fi
+fi
+
 if [ -n "${NEEDS[image]:-}" ]; then
     step_banner "Build per-site image multiwp:wordpress-6-php8.3"
     echo "  Takes ~2 minutes; pulls wordpress:6-php8.3-fpm-alpine and bakes WP-CLI."
@@ -330,15 +395,24 @@ if [ -n "${NEEDS[metrics_cron]:-}" ]; then
     fi
 fi
 
-if [ -n "${NEEDS[symlinks]:-}" ]; then
-    step_banner "Symlink CLI verbs into /usr/local/bin/"
+if [ -n "${NEEDS[wrappers]:-}" ]; then
+    step_banner "Install CLI wrappers in /usr/local/bin/"
     echo "  Lets 'sudo wp-create ...' work without typing the full path."
-    if confirm "ln -s /opt/wp/bin/wp-* /usr/local/bin/ ?"; then
-        # Symlink only operator verbs (skip wp-metrics-poll which is cron-only)
+    echo "  Wrappers (not symlinks) so BASH_SOURCE-based _lib.sh resolution works."
+    if confirm "Install wrappers?"; then
+        # Symlinks would break: 'source \"\$SCRIPT_DIR/_lib.sh\"' resolves SCRIPT_DIR
+        # from BASH_SOURCE[0] which is the symlink path = /usr/local/bin/, where
+        # _lib.sh doesn't exist. Wrappers exec the real script directly.
         for v in wp-create wp-delete wp-pause wp-resume wp-list wp-stats wp-logs wp-exec; do
-            ln -sf "$WP_ROOT/bin/$v" "/usr/local/bin/$v"
+            # Remove any pre-existing symlink first
+            [ -L "/usr/local/bin/$v" ] && rm -f "/usr/local/bin/$v"
+            cat > "/usr/local/bin/$v" <<EOF
+#!/usr/bin/env bash
+exec $WP_ROOT/bin/$v "\$@"
+EOF
+            chmod 755 "/usr/local/bin/$v"
         done
-        ok "symlinks created"
+        ok "wrappers installed"
     else
         warn "skipped — use full path: sudo $WP_ROOT/bin/wp-create ..."
     fi
