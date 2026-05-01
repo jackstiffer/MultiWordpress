@@ -1,11 +1,42 @@
 {{domain}} {
     root * /opt/wp/sites/{{slug}}
-    php_fastcgi 127.0.0.1:{{port}}
 
-    # Defense-in-depth: block PHP execution under uploads/ (in case a
-    # malicious upload bypasses WordPress's MIME sanitization).
+    # Defense-in-depth: deny direct access to sensitive files. WordPress
+    # itself never serves these as text, but a future config bug could.
+    @forbidden path /wp-config.php /wp-config-extras.php /xmlrpc.php /readme.html /license.txt /.htaccess /.git/*
+    respond @forbidden 403
+
+    # Block PHP execution under uploads/ in case a malicious upload bypasses
+    # WordPress's MIME sanitization.
     @uploads_php path_regexp ^/wp-content/uploads/.*\.php$
     respond @uploads_php 403
 
-    encode gzip zstd
+    # Long-cache static assets. Cloudflare honors this and so do browsers.
+    @static path_regexp \.(css|js|woff2?|ttf|jpe?g|png|gif|svg|webp|avif|ico)$
+    header @static Cache-Control "public, max-age=31536000, immutable"
+
+    # HSTS — force HTTPS for a year. (Skip `preload` until every subdomain
+    # is HTTPS; preload is hard to undo.)
+    header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+
+    # Dynamic requests → php-fpm in the per-site container. The FPM-side
+    # webroot is /var/www/html (compose bind-mount target). Override the
+    # SCRIPT_FILENAME root so it matches what FPM sees, otherwise FPM
+    # returns "File not found".
+    php_fastcgi 127.0.0.1:{{port}} {
+        root /var/www/html
+        read_timeout 300s
+        write_timeout 300s
+    }
+
+    # Serve static assets directly from the host bind-mount. Required —
+    # without this, non-PHP requests return empty 200s with no Content-Type
+    # and wp-admin module scripts fail to load.
+    file_server
+
+    encode {
+        gzip
+        zstd
+        minimum_length 1024
+    }
 }
