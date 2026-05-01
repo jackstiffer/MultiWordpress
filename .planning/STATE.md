@@ -1,6 +1,6 @@
 # State: MultiWordpress
 
-**Last updated:** 2026-04-30 (post-roadmap)
+**Last updated:** 2026-05-01 - Completed quick task 260501-ebw: Harden Caddy block template and update caddy-cloudflare doc
 
 ## Project Reference
 
@@ -51,6 +51,12 @@
 ### Blockers
 
 - (none)
+
+### Quick Tasks Completed
+
+| # | Description | Date | Commit | Directory |
+|---|-------------|------|--------|-----------|
+| 260501-ebw | Harden Caddy block template and update caddy-cloudflare doc | 2026-05-01 | d98cb9a | [260501-ebw-harden-caddy-block-template-and-update-c](./quick/260501-ebw-harden-caddy-block-template-and-update-c/) |
 
 ### Open Questions Carried From Research
 
