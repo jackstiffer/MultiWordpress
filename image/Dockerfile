@@ -12,6 +12,16 @@ RUN apk add --no-cache --virtual .wpcli-deps less mysql-client bash curl \
  && chmod +x /usr/local/bin/wp \
  && /usr/local/bin/wp --info --allow-root
 
+# PhpRedis (C extension) — required by Super Page Cache for Cloudflare's
+# Pro feature check, and ~2–5× faster than the Predis pure-PHP fallback.
+# Build deps are installed virtual and removed after compile so the final
+# image stays slim.
+RUN apk add --no-cache --virtual .phpredis-build $PHPIZE_DEPS \
+ && pecl install redis \
+ && docker-php-ext-enable redis \
+ && apk del .phpredis-build \
+ && rm -rf /tmp/pear
+
 # PHP + OPcache overrides (IMG-03, IMG-04).
 COPY php.d-zz-wp.ini /usr/local/etc/php/conf.d/zz-wp.ini
 
