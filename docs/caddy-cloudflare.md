@@ -2,6 +2,44 @@
 
 Operator runbook for the reverse-proxy + edge-cache layer that sits in front of every WordPress site, AudioStoryV2, and the dashboard. This stack does **not** ship its own reverse proxy — host Caddy (already running for AudioStoryV2) handles everything.
 
+## Global Caddyfile config (once per host)
+
+At the top of `/etc/caddy/Caddyfile`, add a global options block so Caddy
+trusts Cloudflare's `X-Forwarded-For` and reports the real visitor IP to
+every site (WordPress, AudioStoryV2, dashboard):
+
+```
+{
+    servers {
+        trusted_proxies static \
+            173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 \
+            141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 \
+            188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 \
+            162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 \
+            172.64.0.0/13 131.0.72.0/22 \
+            2400:cb00::/32 2606:4700::/32 2803:f800::/32 \
+            2405:b500::/32 2405:8100::/32 2a06:98c0::/29 \
+            2c0f:f248::/32
+    }
+}
+```
+
+Source: `https://www.cloudflare.com/ips-v4` and `/ips-v6`. Refresh once
+a year — Cloudflare changes ranges rarely.
+
+**Effect:** Caddy's `{client_ip}` placeholder and FPM's `REMOTE_ADDR` env
+var resolve to the real visitor IP (parsed from `CF-Connecting-IP` /
+`X-Forwarded-For`) instead of a Cloudflare edge IP. Without this,
+WordPress security plugins, comment spam detection, and audit logs see
+only Cloudflare's IPs and become useless.
+
+**AudioStoryV2 impact:** None. Caddy still proxies `X-Forwarded-*`
+headers to Next.js regardless of `trusted_proxies` — Next.js parses
+them itself. This setting only changes Caddy's *own* client_ip
+resolution, which only affects access logs and FPM's REMOTE_ADDR.
+
+Requires Caddy 2.7 or newer.
+
 ## How host Caddy fits
 
 Single Caddyfile on the VM (typically `/etc/caddy/Caddyfile`). Sites coexist under one config:
@@ -15,12 +53,45 @@ open.dirtyvocal.com {
 # WordPress site (block printed by `wp-create`)
 blog.dirtyvocal.com {
     root * /opt/wp/sites/blog_dirtyvocal_com
-    php_fastcgi 127.0.0.1:18001
 
+    # Defense-in-depth: deny direct access to sensitive files. WordPress
+    # itself never serves these as text, but a future config bug could.
+    @forbidden path /wp-config.php /wp-config-extras.php /xmlrpc.php /readme.html /license.txt /.htaccess /.git/*
+    respond @forbidden 403
+
+    # Block PHP execution under uploads/ in case a malicious upload bypasses
+    # WordPress's MIME sanitization.
     @uploads_php path_regexp ^/wp-content/uploads/.*\.php$
     respond @uploads_php 403
 
-    encode gzip zstd
+    # Long-cache static assets. Cloudflare honors this and so do browsers.
+    @static path_regexp \.(css|js|woff2?|ttf|jpe?g|png|gif|svg|webp|avif|ico)$
+    header @static Cache-Control "public, max-age=31536000, immutable"
+
+    # HSTS — force HTTPS for a year. (Skip `preload` until every subdomain
+    # is HTTPS; preload is hard to undo.)
+    header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+
+    # Dynamic requests → php-fpm in the per-site container. The FPM-side
+    # webroot is /var/www/html (compose bind-mount target). Override the
+    # SCRIPT_FILENAME root so it matches what FPM sees, otherwise FPM
+    # returns "File not found".
+    php_fastcgi 127.0.0.1:18001 {
+        root /var/www/html
+        read_timeout 300s
+        write_timeout 300s
+    }
+
+    # Serve static assets directly from the host bind-mount. Required —
+    # without this, non-PHP requests return empty 200s with no Content-Type
+    # and wp-admin module scripts fail to load.
+    file_server
+
+    encode {
+        gzip
+        zstd
+        minimum_length 1024
+    }
 }
 
 # Dashboard (Phase 4)
